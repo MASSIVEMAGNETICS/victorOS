@@ -39,6 +39,7 @@ class GodTierVersion:
 
     def _write_state(self, state: VersionState) -> VersionState:
         self.version_file.write_text(json.dumps(asdict(state), indent=2))
+        self.state = state
         return state
 
     def bump(self, kind: str = "patch", build_id: Optional[str] = None) -> VersionState:

@@ -12,6 +12,7 @@ from .version_engine import GodTierVersion
 from .save3_trust import SAVE3Trust, AuditLedger
 from .metadata_processor import MetadataEngine
 from .rollout_scheduler import RolloutScheduler
+from .synthetic_core import SyntheticCognitiveCore
 from .core_router import CORERouter
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "AuditLedger",
     "MetadataEngine",
     "RolloutScheduler",
+    "SyntheticCognitiveCore",
     "CORERouter",
 ]
