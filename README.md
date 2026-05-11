@@ -119,7 +119,9 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-41 tests covering: `GodTierVersion`, `SAVE3Trust`, `AuditLedger`, `MetadataEngine`, `RolloutScheduler`, `SyntheticCognitiveCore`, `PredictiveCoder`, `SymbolicRouter`, `ContradictionResolver`, `FractalNode`.
+Alternatively, `pytest tests/ -v` can be run directly as `conftest.py` adds the necessary path resolution.
+
+43 tests covering: `GodTierVersion`, `SAVE3Trust`, `AuditLedger`, `MetadataEngine`, `RolloutScheduler`, `SyntheticCognitiveCore`, `PredictiveCoder`, `SymbolicRouter`, `ContradictionResolver`, `FractalNode`, and `VOSApp Registry`.
 
 ---
 
@@ -142,3 +144,20 @@ Check it: **AuditVault app → Verify Integrity button**.
 | v0.1.0 | ✅ Core runtime, 6 apps, VOS shell, synthetic core, SAVE3 |
 | v0.5.0 | Stripe/MRR engine, Supabase integration, ad-spend simulation |
 | v1.0.0 | GPU tensor acceleration, long-term memory pipeline, multi-node sync |
+
+---
+
+## Contributing
+
+We welcome contributions to the **VictorOS** ecosystem. To contribute:
+1. Fork the repository.
+2. Create your feature branch (`git checkout -b feature/NewApp`).
+3. Ensure you follow standard `VOSApp` registry integration protocols.
+4. Run tests via `pytest tests/ -v` ensuring all changes are thoroughly validated.
+5. Commit your changes and open a pull request.
+
+---
+
+## License
+
+This project is open-source and available under the MIT License.
