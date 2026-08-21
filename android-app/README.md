@@ -10,6 +10,7 @@ Native, offline-first Android shell for persistent experience intelligence.
 - Persistent homeostatic metrics.
 - Bounded command interpreter with explicit policy/authority failures.
 - Zero Android permissions and no network access.
+- Android application backup disabled so private VictorOS state is not exported through the normal Android backup path.
 - Android 8.0+ (`minSdk 26`), targeting Android 15 (`targetSdk 35`).
 
 This build is a governed OS-style cognitive shell. It does **not** claim to be AGI and does not yet embed a local language model.
@@ -30,4 +31,6 @@ CLI after Android Studio creates/downloads the wrapper:
 
 ## Security boundary
 
-The app requests no permissions. Its command system can modify only its private SharedPreferences state. Receipts detect accidental or unauthorized event-chain changes, but the private preference store is not encrypted in v0.1. Device compromise/root is outside the current threat boundary.
+The app requests no Android permissions. Its command system can modify only its private SharedPreferences state. Android backup is disabled and cleartext traffic is disabled in the application manifest. CI inspects the built debug APK—not only the source manifest—and fails if a merged manifest introduces any Android permission, enables application backup, or enables cleartext traffic.
+
+Receipts detect accidental or unauthorized event-chain changes, but the private preference store is not encrypted in v0.1. Device compromise/root, physical extraction outside normal Android backup, and compromise of the OS itself remain outside the current threat boundary.
