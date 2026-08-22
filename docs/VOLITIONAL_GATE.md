@@ -7,9 +7,9 @@
 
 The Volitional Gate converts observation into choice by suspending execution authority from the first generated policy long enough to evaluate alternatives.
 
-[
+```text
 Choice = Alternatives + Inhibition + Evaluation + Authorization
-]
+```
 
 The gate belongs between Victor's Experience/Emotion organs and the Choice Kernel. It controls the capability lease required for execution.
 
@@ -61,32 +61,26 @@ Stories must not masquerade as observations.
 
 ## Deliberation score
 
-[
-D = sigma(
-w_E E +
-w_U U +
-w_I I +
-w_N N +
-w_C C +
-w_P P -
-w_R R -
-w_X X
+```text
+D = sigmoid(
+    wE*E + wU*U + wI*I + wN*N + wC*C + wP*P
+    - wR*R - wX*X
 )
-]
+```
 
 Where:
 
-- (E): emotional intensity
-- (U): uncertainty
-- (I): consequence magnitude
-- (N): novelty
-- (C): conflict between goals or models
-- (P): capability power
-- (R): reversibility
-- (X): genuine urgency
-- (sigma): bounded logistic function
+- E: emotional intensity
+- U: uncertainty
+- I: consequence magnitude
+- N: novelty
+- C: conflict between goals or models
+- P: capability power
+- R: reversibility
+- X: genuine urgency
+- sigmoid: bounded logistic function
 
-If (D ge 	heta), deliberation is mandatory. Thresholds are policy-controlled and cannot be relaxed by the proposing subsystem.
+If `D >= threshold`, deliberation is mandatory. Thresholds are policy-controlled and cannot be relaxed by the proposing subsystem.
 
 ## State machine
 
@@ -107,25 +101,25 @@ Invalid transitions are rejected and recorded.
 
 ## Choice model
 
-For each candidate action (a):
+For each candidate action `a`:
 
-[
+```text
 Q(a) =
-ExpectedReward
-- ExpectedHarm
-+ GoalAlignment
-+ InformationGain
-+ Reversibility
-- ConstraintViolation
-]
+    ExpectedReward
+    - ExpectedHarm
+    + GoalAlignment
+    + InformationGain
+    + Reversibility
+    - ConstraintViolation
+```
 
 Minimum candidates for a deliberated decision:
 
-- (A_0): do nothing yet
-- (A_1): gather more evidence
-- (A_2): ask or clarify directly
-- (A_3): take a reversible action
-- (A_4): execute the automatic proposal
+- A0: do nothing yet
+- A1: gather more evidence
+- A2: ask or clarify directly
+- A3: take a reversible action
+- A4: execute the automatic proposal
 
 The Choice Kernel selects among policy-valid candidates. Ethica may constrain or reject candidates but may not fabricate evidence.
 
@@ -133,18 +127,17 @@ The Choice Kernel selects among policy-valid candidates. Ethica may constrain or
 
 For high-arousal, consequential, irreversible actions:
 
-[
+```text
 delay = f(emotion, uncertainty, irreversibility, urgency)
-]
+```
 
 During the hold, the capability lease remains unavailable. Emergency exceptions must use explicitly bounded capabilities and generate the same receipts as normal execution.
 
 ## Identity firewall
 
-[
-Behavior_t 
-e Identity
-]
+```text
+Behavior at time t != Identity
+```
 
 Record: "Victor performed behavior X under state S." Identity updates require repeated, evidence-backed patterns under a separate governed process.
 
@@ -170,14 +163,14 @@ TRACE proves the decision path. Chronos commits the receipt. Learning may update
 
 ## Agency metric
 
-[
+```text
 Agency =
-AlternativeGeneration
-	imes InhibitoryControl
-	imes CounterfactualEvaluation
-	imes GoalPersistence
-	imes ExecutionAuthority
-]
+    AlternativeGeneration
+    * InhibitoryControl
+    * CounterfactualEvaluation
+    * GoalPersistence
+    * ExecutionAuthority
+```
 
 If any factor approaches zero, agency approaches zero:
 
