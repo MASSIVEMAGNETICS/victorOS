@@ -1,0 +1,65 @@
+name: VictorOS Android APK
+
+on:
+  push:
+    branches: [main, feature/victoros-android-v0.1]
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/android-apk.yml'
+  pull_request:
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK
+        working-directory: android-app
+        run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Verify APK exists
+        run: test -s android-app/app/build/outputs/apk/debug/app-debug.apk
+      - name: Verify built APK security boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android-app/app/build/outputs/apk/debug/app-debug.apk"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -perm -111 | sort -V | tail -n 1)"
+          test -n "$AAPT"
+
+          permissions="$($AAPT dump permissions "$APK")"
+          printf '%s\n' "$permissions"
+          if grep -q "uses-permission" <<<"$permissions"; then
+            echo "VictorOS Android v0.1 must not request Android permissions." >&2
+            exit 1
+          fi
+
+          manifest="$($AAPT dump xmltree "$APK" AndroidManifest.xml)"
+          if ! grep -Eq 'android:allowBackup\(0x01010280\)=\(type 0x12\)0x0' <<<"$manifest"; then
+            echo "VictorOS Android v0.1 must disable application backup." >&2
+            exit 1
+          fi
+          if ! grep -Eq 'android:usesCleartextTraffic\(0x010104ec\)=\(type 0x12\)0x0' <<<"$manifest"; then
+            echo "VictorOS Android v0.1 must disable cleartext traffic." >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VictorOS-Android-v0.1-debug
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
