@@ -2,7 +2,7 @@ name: VictorOS Android APK
 
 on:
   push:
-    branches: [main, feature/victoros-android-v0.1]
+    branches: [main, feature/victor-gev-mobile-control-v0.2]
     paths:
       - 'android-app/**'
       - '.github/workflows/android-apk.yml'
@@ -43,23 +43,33 @@ jobs:
 
           permissions="$($AAPT dump permissions "$APK")"
           printf '%s\n' "$permissions"
-          if grep -q "uses-permission" <<<"$permissions"; then
-            echo "VictorOS Android v0.1 must not request Android permissions." >&2
+
+          requested="$(grep "uses-permission" <<<"$permissions" || true)"
+          if [[ -n "$requested" ]]; then
+            unexpected="$(grep -v "android.permission.INTERNET" <<<"$requested" || true)"
+            if [[ -n "$unexpected" ]]; then
+              echo "Victor GEV Android v0.2 may request only android.permission.INTERNET." >&2
+              printf '%s\n' "$unexpected" >&2
+              exit 1
+            fi
+          fi
+          if ! grep -q "android.permission.INTERNET" <<<"$permissions"; then
+            echo "Victor GEV Android v0.2 requires INTERNET for explicit HTTPS synchronization." >&2
             exit 1
           fi
 
           manifest="$($AAPT dump xmltree "$APK" AndroidManifest.xml)"
           if ! grep -Eq 'android:allowBackup\(0x01010280\)=\(type 0x12\)0x0' <<<"$manifest"; then
-            echo "VictorOS Android v0.1 must disable application backup." >&2
+            echo "Victor GEV Android must disable application backup." >&2
             exit 1
           fi
           if ! grep -Eq 'android:usesCleartextTraffic\(0x010104ec\)=\(type 0x12\)0x0' <<<"$manifest"; then
-            echo "VictorOS Android v0.1 must disable cleartext traffic." >&2
+            echo "Victor GEV Android must disable cleartext traffic." >&2
             exit 1
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: VictorOS-Android-v0.1-debug
+          name: Victor-GEV-Android-v0.2-debug
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
