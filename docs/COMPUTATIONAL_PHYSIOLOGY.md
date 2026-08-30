@@ -50,13 +50,15 @@ It includes:
 - security pressure
 - Human STOP state
 - governance mode
-- canonical receipt head
+- physiology receipt head
 - capability lease counts
 - immune alerts
 - unresolved authority conflicts
 - per-organ telemetry
 
 All values that represent bounded pressures or integrity are normalized to `[0, 1]`.
+
+The physiology receipt head is deliberately separate from any future Chronos canonical identity/state head. A physiology receipt does not silently become a canonical identity mutation.
 
 ## Governance modes
 
@@ -84,7 +86,7 @@ INTENT
   -> PHYSIOLOGY STATE
   -> CONSTITUTION
   -> PROVENANCE
-  -> AUTHORITY
+  -> TRUSTED RUNTIME AUTHORITY
   -> INDEPENDENT RISK SCORE
   -> TEMPORAL INHIBITION
   -> GOVERNANCE MODE
@@ -92,7 +94,7 @@ INTENT
   -> EXECUTION
   -> OBSERVATION
   -> HASH-LINKED RECEIPT
-  -> CANONICAL HEAD UPDATE
+  -> PHYSIOLOGY RECEIPT HEAD UPDATE
 ```
 
 No organ should call an external effect directly. The target integration rule is:
@@ -120,13 +122,35 @@ High risk produces `DEFERRED`, not automatic execution.
 
 High arousal plus high irreversibility creates temporal inhibition unless an explicitly bounded emergency policy applies.
 
-## Authority and provenance
+## Authority boundary
 
-A proposal must provide provenance and must satisfy all declared `required_authorities`.
+A proposal may declare which authorities an action requires. It may **not** declare that those authorities have been granted.
 
-Missing provenance or missing authority is a hard rejection.
+Granted authority is supplied to `VictorPhysiologyRuntime` from the trusted host/runtime context and is not stored in `ActionProposal`.
 
-Authority is explicit data, not inferred from confidence, model preference, or urgency.
+```text
+proposal.required_authorities
+        !=
+runtime.granted_authorities
+```
+
+This separation prevents the proposing subsystem from authorizing itself.
+
+Missing required authority is a hard rejection. Authority is explicit trusted state, not inferred from confidence, urgency, metadata, or model preference.
+
+## Emergency policy boundary
+
+An action may name an emergency policy, but naming one does not activate it.
+
+`VictorPhysiologyRuntime` maintains an independently configured set of allowed emergency policies. An emergency bypass is considered bounded only when the named policy is trusted by the runtime and urgency/capability/consequence limits are satisfied.
+
+A proposal therefore cannot self-exempt from inhibition by inventing an emergency-policy string.
+
+## Provenance
+
+Every action proposal requires non-empty provenance. Missing provenance is a hard rejection.
+
+Provenance does not confer authority; it provides traceability for how the proposal entered the organism.
 
 ## Capability leases
 
@@ -186,7 +210,7 @@ TRACE proves.
 Chronos learns.
 ```
 
-Computational Physiology provides the executable substrate beneath that architecture: organism state, independent risk, authority/provenance enforcement, governance modes, leases, Human STOP, and receipt integrity.
+Computational Physiology provides the executable substrate beneath that architecture: organism state, independent risk, trusted authority/provenance enforcement, governance modes, leases, Human STOP, and receipt integrity.
 
 ## Organ-system mapping
 
@@ -208,15 +232,17 @@ The v1 runtime is acceptable only if all of the following hold:
 
 1. Missing provenance fails closed.
 2. Missing required authority fails closed.
-3. Human STOP enters BLACK mode and revokes active leases.
-4. Critical identity or continuity damage enters BLACK mode.
-5. High-risk irreversible actions do not receive a capability lease.
-6. Low-risk valid actions receive a capability-scoped lease.
-7. Denied actions never invoke their executor.
-8. Authorized execution consumes its lease.
-9. Execution outcomes receive hash-linked receipts.
-10. Receipt tampering is detectable.
-11. A corrupt receipt ledger on restart forces BLACK mode.
+3. A proposal cannot self-grant authority through its own fields or metadata.
+4. An untrusted self-declared emergency policy cannot bypass inhibition.
+5. Human STOP enters BLACK mode and revokes active leases.
+6. Critical identity or continuity damage enters BLACK mode.
+7. High-risk irreversible actions do not receive a capability lease.
+8. Low-risk valid actions receive a capability-scoped lease.
+9. Denied actions never invoke their executor.
+10. Authorized execution consumes its lease.
+11. Execution outcomes receive hash-linked receipts.
+12. Receipt tampering is detectable.
+13. A corrupt receipt ledger on restart forces BLACK mode.
 
 ## Next integration boundary
 
