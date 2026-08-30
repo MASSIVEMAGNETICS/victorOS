@@ -14,6 +14,17 @@ from .metadata_processor import MetadataEngine
 from .rollout_scheduler import RolloutScheduler
 from .synthetic_core import SyntheticCognitiveCore
 from .core_router import CORERouter
+from .physiology import (
+    CONSTITUTIONAL_INVARIANTS,
+    ActionProposal,
+    CapabilityLease,
+    DecisionStatus,
+    GateDecision,
+    GovernanceMode,
+    PhysiologyReceiptLedger,
+    VictorPhysiologyRuntime,
+    VictorPhysiologyState,
+)
 
 __all__ = [
     "GodTierVersion",
@@ -23,4 +34,13 @@ __all__ = [
     "RolloutScheduler",
     "SyntheticCognitiveCore",
     "CORERouter",
+    "CONSTITUTIONAL_INVARIANTS",
+    "ActionProposal",
+    "CapabilityLease",
+    "DecisionStatus",
+    "GateDecision",
+    "GovernanceMode",
+    "PhysiologyReceiptLedger",
+    "VictorPhysiologyRuntime",
+    "VictorPhysiologyState",
 ]
