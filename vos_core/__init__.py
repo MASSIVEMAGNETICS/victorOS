@@ -25,6 +25,7 @@ from .physiology import (
     VictorPhysiologyRuntime,
     VictorPhysiologyState,
 )
+from .resonance_ledger import ResonanceLedger, ResonanceVector
 
 __all__ = [
     "GodTierVersion",
@@ -43,4 +44,6 @@ __all__ = [
     "PhysiologyReceiptLedger",
     "VictorPhysiologyRuntime",
     "VictorPhysiologyState",
+    "ResonanceLedger",
+    "ResonanceVector",
 ]
