@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 CONSTITUTIONAL_INVARIANTS: Tuple[str, ...] = (
@@ -59,7 +59,7 @@ class VictorPhysiologyState:
     security_pressure: float = 0.0
     human_stop: bool = False
     governance_mode: GovernanceMode = GovernanceMode.GREEN
-    canonical_head: str = "GENESIS"
+    physiology_receipt_head: str = "GENESIS"
     active_leases: int = 0
     revoked_leases: int = 0
     immune_alerts: int = 0
@@ -117,7 +117,6 @@ class ActionProposal:
     name: str
     capability: str
     provenance: str
-    provided_authorities: Tuple[str, ...] = ()
     required_authorities: Tuple[str, ...] = ()
     consequence: float = 0.0
     irreversibility: float = 0.0
@@ -147,7 +146,6 @@ class ActionProposal:
             name=self.name,
             capability=self.capability,
             provenance=self.provenance,
-            provided_authorities=tuple(self.provided_authorities),
             required_authorities=tuple(self.required_authorities),
             emergency_policy=self.emergency_policy,
             metadata=dict(self.metadata),
@@ -252,8 +250,8 @@ class VictorPhysiologyRuntime:
     """Root governed-organism runtime object.
 
     No consequential action should execute directly. A proposal is evaluated
-    against organism state, authority and provenance, then receives a bounded
-    capability lease only if it survives the gate.
+    against organism state, trusted runtime authority and provenance, then
+    receives a bounded capability lease only if it survives the gate.
     """
 
     def __init__(
@@ -262,6 +260,8 @@ class VictorPhysiologyRuntime:
         receipt_ledger: Optional[PhysiologyReceiptLedger] = None,
         lease_ttl_seconds: int = 30,
         risk_threshold: float = 0.72,
+        granted_authorities: Iterable[str] = (),
+        allowed_emergency_policies: Iterable[str] = (),
     ):
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be > 0")
@@ -269,6 +269,10 @@ class VictorPhysiologyRuntime:
         self.receipts = receipt_ledger or PhysiologyReceiptLedger()
         self.lease_ttl_seconds = int(lease_ttl_seconds)
         self.risk_threshold = _clamp01(float(risk_threshold))
+        self._granted_authorities = frozenset(str(a) for a in granted_authorities if str(a).strip())
+        self._allowed_emergency_policies = frozenset(
+            str(p) for p in allowed_emergency_policies if str(p).strip()
+        )
         self._leases: Dict[str, CapabilityLease] = {}
         self.state.recompute_mode()
 
@@ -282,7 +286,10 @@ class VictorPhysiologyRuntime:
             raise ValueError("organ name is required")
         self.state.organ_telemetry[organ] = dict(telemetry)
         mode = self.state.recompute_mode()
-        self._commit_state_event("organ_state", {"organ": organ, "telemetry": dict(telemetry), "mode": mode.value})
+        self._commit_state_event(
+            "organ_state",
+            {"organ": organ, "telemetry": dict(telemetry), "mode": mode.value},
+        )
         return mode
 
     def set_human_stop(self, enabled: bool = True) -> GovernanceMode:
@@ -306,7 +313,7 @@ class VictorPhysiologyRuntime:
         proposal = proposal.normalized()
         mode = self.state.recompute_mode()
         reasons: List[str] = []
-        missing_authority = sorted(set(proposal.required_authorities) - set(proposal.provided_authorities))
+        missing_authority = sorted(set(proposal.required_authorities) - self._granted_authorities)
         risk = self._independent_risk_score(proposal)
         status = DecisionStatus.AUTHORIZED
 
@@ -361,9 +368,10 @@ class VictorPhysiologyRuntime:
             "status": status.value,
             "reasons": reasons,
             "constitutional_invariants": list(CONSTITUTIONAL_INVARIANTS),
+            "trusted_authority_context": sorted(self._granted_authorities),
         }
         receipt_hash = self.receipts.append("gate_decision", receipt_payload)
-        self.state.canonical_head = receipt_hash
+        self.state.physiology_receipt_head = receipt_hash
 
         lease = None
         if status == DecisionStatus.AUTHORIZED:
@@ -391,7 +399,7 @@ class VictorPhysiologyRuntime:
                 "execution_blocked",
                 {"action_id": proposal.action_id, "reason": "invalid_or_expired_lease"},
             )
-            self.state.canonical_head = failure_hash
+            self.state.physiology_receipt_head = failure_hash
             decision.status = DecisionStatus.REJECTED
             decision.reasons.append("invalid_or_expired_lease")
             decision.receipt_hash = failure_hash
@@ -415,7 +423,7 @@ class VictorPhysiologyRuntime:
                 "outcome": outcome,
             },
         )
-        self.state.canonical_head = final_hash
+        self.state.physiology_receipt_head = final_hash
         decision.status = status
         decision.actual_outcome = outcome
         decision.receipt_hash = final_hash
@@ -449,12 +457,13 @@ class VictorPhysiologyRuntime:
 
     def _commit_state_event(self, event_type: str, payload: Mapping[str, Any]) -> str:
         receipt_hash = self.receipts.append(event_type, payload)
-        self.state.canonical_head = receipt_hash
+        self.state.physiology_receipt_head = receipt_hash
         return receipt_hash
 
     def _bounded_emergency(self, proposal: ActionProposal) -> bool:
         return bool(
             proposal.emergency_policy
+            and proposal.emergency_policy in self._allowed_emergency_policies
             and proposal.urgency >= 0.85
             and proposal.capability_power <= 0.35
             and proposal.consequence <= 0.50
