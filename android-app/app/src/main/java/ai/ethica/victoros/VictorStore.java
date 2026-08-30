@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 public final class VictorStore implements VictorPhysiology.ReceiptLedger, VictorPhysiology.StatePersistence {
-    private static final String PREFS = "victor_os_state_v2";
+    private static final String PREFS = "victor_os_state_v1";
     private static final String EVENTS = "events";
     private static final String PHYS = "phys_";
     private final SharedPreferences prefs;
