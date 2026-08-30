@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VictorOS</string>
+    <string name="victor_accessibility_description">Victor God\'s Eye View: reads the active UI hierarchy on this device to build a local shared world model. It does not perform gestures in v0.2.</string>
+</resources>

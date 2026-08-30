@@ -2,7 +2,7 @@ name: VictorOS Android APK
 
 on:
   push:
-    branches: [main, feature/victoros-android-v0.1]
+    branches: [main, feat/android-governed-organism-v0.2]
     paths:
       - 'android-app/**'
       - '.github/workflows/android-apk.yml'
@@ -28,12 +28,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK
+      - name: Test governed core and build debug APK
         working-directory: android-app
-        run: gradle --no-daemon --stacktrace assembleDebug
+        run: gradle --no-daemon --stacktrace testDebugUnitTest assembleDebug
       - name: Verify APK exists
         run: test -s android-app/app/build/outputs/apk/debug/app-debug.apk
-      - name: Verify built APK security boundary
+      - name: Verify governed sensory security boundary
         shell: bash
         run: |
           set -euo pipefail
@@ -41,25 +41,43 @@ jobs:
           AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -perm -111 | sort -V | tail -n 1)"
           test -n "$AAPT"
 
-          permissions="$($AAPT dump permissions "$APK")"
-          printf '%s\n' "$permissions"
-          if grep -q "uses-permission" <<<"$permissions"; then
-            echo "VictorOS Android v0.1 must not request Android permissions." >&2
+          actual="$($AAPT dump permissions "$APK" | sed -n "s/.*name='\([^']*\)'.*/\1/p" | sort -u)"
+          expected="$(cat <<'EOF'
+          android.permission.CAMERA
+          android.permission.FOREGROUND_SERVICE
+          android.permission.FOREGROUND_SERVICE_CAMERA
+          android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION
+          android.permission.FOREGROUND_SERVICE_MICROPHONE
+          android.permission.PACKAGE_USAGE_STATS
+          android.permission.POST_NOTIFICATIONS
+          android.permission.RECORD_AUDIO
+          EOF
+          )"
+          expected="$(printf '%s\n' "$expected" | sed 's/^[[:space:]]*//' | sort -u)"
+          echo "Declared permissions:"; printf '%s\n' "$actual"
+          unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected") || true)"
+          missing="$(comm -13 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected") || true)"
+          test -z "$unexpected" || { echo "Unexpected permissions: $unexpected" >&2; exit 1; }
+          test -z "$missing" || { echo "Missing required permissions: $missing" >&2; exit 1; }
+          if grep -q '^android.permission.INTERNET$' <<<"$actual"; then
+            echo "God's Eye v0.2 must remain local-only: INTERNET forbidden." >&2
             exit 1
           fi
 
           manifest="$($AAPT dump xmltree "$APK" AndroidManifest.xml)"
           if ! grep -Eq 'android:allowBackup\(0x01010280\)=\(type 0x12\)0x0' <<<"$manifest"; then
-            echo "VictorOS Android v0.1 must disable application backup." >&2
-            exit 1
+            echo "VictorOS must disable application backup." >&2; exit 1
           fi
           if ! grep -Eq 'android:usesCleartextTraffic\(0x010104ec\)=\(type 0x12\)0x0' <<<"$manifest"; then
-            echo "VictorOS Android v0.1 must disable cleartext traffic." >&2
-            exit 1
+            echo "VictorOS must disable cleartext traffic." >&2; exit 1
           fi
+          grep -q 'VictorAccessibilityService' <<<"$manifest" || { echo "Accessibility sensory service missing" >&2; exit 1; }
+          grep -q 'VictorScreenCaptureService' <<<"$manifest" || { echo "Screen sensory service missing" >&2; exit 1; }
+          grep -q 'VictorCameraService' <<<"$manifest" || { echo "Camera sensory service missing" >&2; exit 1; }
+          grep -q 'VictorMicrophoneService' <<<"$manifest" || { echo "Microphone sensory service missing" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: VictorOS-Android-v0.1-debug
+          name: VictorOS-Android-v0.2-Governed-Organism-debug
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
