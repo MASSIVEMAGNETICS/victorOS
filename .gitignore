@@ -13,6 +13,7 @@ build/
 .synthetic_state.json
 vos_audit.jsonl
 victor_physiology_receipts.jsonl
+.victor/
 
 # Pytest
 .pytest_cache/
