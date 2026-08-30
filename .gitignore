@@ -12,6 +12,7 @@ build/
 .vos_version.json
 .synthetic_state.json
 vos_audit.jsonl
+victor_physiology_receipts.jsonl
 
 # Pytest
 .pytest_cache/
