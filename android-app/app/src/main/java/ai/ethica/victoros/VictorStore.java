@@ -28,8 +28,9 @@ public final class VictorStore implements VictorPhysiology.ReceiptLedger, Victor
     }
 
     public synchronized String append(String organ, String message, String state) {
+        if (!verifyIntegrity()) throw new IllegalStateException("Receipt ledger is corrupt; mutation refused");
         try {
-            JSONArray events = events();
+            JSONArray events = strictEvents();
             JSONObject event = new JSONObject();
             String timestamp = Instant.now().toString();
             String previous = events.length() == 0 ? "GENESIS" : events.getJSONObject(events.length()-1).getString("hash");
@@ -47,9 +48,15 @@ public final class VictorStore implements VictorPhysiology.ReceiptLedger, Victor
     }
 
     @Override public synchronized String append(String eventType, Map<String, String> payload) {
+        if (!verifyIntegrity()) return "CORRUPT";
         TreeMap<String,String> sorted = new TreeMap<>(payload);
         JSONObject json = new JSONObject(sorted);
         return append("PHYSIOLOGY", eventType + " " + json, eventType.toUpperCase());
+    }
+
+    private JSONArray strictEvents() {
+        try { return new JSONArray(prefs.getString(EVENTS, "[]")); }
+        catch (JSONException e) { throw new IllegalStateException("Malformed receipt ledger", e); }
     }
 
     public synchronized JSONArray events() {
@@ -119,10 +126,12 @@ public final class VictorStore implements VictorPhysiology.ReceiptLedger, Victor
     }
 
     public synchronized void recordGodsEyeMetadata(String source, String hash, int bytes, String summary) {
+        if (!verifyIntegrity()) return;
         String safeSummary = summary == null ? "" : summary.replace('\n',' ').replace('\r',' ');
         if (safeSummary.length() > 180) safeSummary = safeSummary.substring(0,180);
-        prefs.edit().putString("gods_eye_last", source + " | " + hash + " | " + bytes + " bytes | " + safeSummary).apply();
+        String metadata = source + " | " + hash + " | " + bytes + " bytes | " + safeSummary;
         append("GODS_EYE", source + " hash=" + hash + " bytes=" + bytes, "OBSERVED");
+        prefs.edit().putString("gods_eye_last", metadata).apply();
     }
 
     public String latestGodsEyeMetadata() { return prefs.getString("gods_eye_last","No observations yet"); }
