@@ -31,6 +31,17 @@ jobs:
       - name: Test governed core and perception fusion; build debug APK
         working-directory: android-app
         run: gradle --no-daemon --stacktrace testDebugUnitTest assembleDebug
+      - name: Prove owner release signing fails closed when identity is absent
+        working-directory: android-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset VICTOR_ANDROID_KEYSTORE_PATH VICTOR_ANDROID_STORE_PASSWORD VICTOR_ANDROID_KEY_ALIAS VICTOR_ANDROID_KEY_PASSWORD
+          if gradle --no-daemon verifyOwnerReleaseSigning; then
+            echo "Owner release verification unexpectedly succeeded without signing identity." >&2
+            exit 1
+          fi
+          echo "Release signing correctly refused missing owner identity."
       - name: Verify APK exists
         run: test -s android-app/app/build/outputs/apk/debug/app-debug.apk
       - name: Verify governed sensory security boundary

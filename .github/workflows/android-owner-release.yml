@@ -1,0 +1,96 @@
+name: VictorOS Owner-Signed Android Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'android-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VICTOR_KEYSTORE_B64: ${{ secrets.VICTOR_ANDROID_KEYSTORE_B64 }}
+      VICTOR_ANDROID_STORE_PASSWORD: ${{ secrets.VICTOR_ANDROID_STORE_PASSWORD }}
+      VICTOR_ANDROID_KEY_ALIAS: ${{ secrets.VICTOR_ANDROID_KEY_ALIAS }}
+      VICTOR_ANDROID_KEY_PASSWORD: ${{ secrets.VICTOR_ANDROID_KEY_PASSWORD }}
+      VICTOR_ANDROID_SIGNER_SHA256: ${{ secrets.VICTOR_ANDROID_SIGNER_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Materialize owner signing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in VICTOR_KEYSTORE_B64 VICTOR_ANDROID_STORE_PASSWORD VICTOR_ANDROID_KEY_ALIAS VICTOR_ANDROID_KEY_PASSWORD VICTOR_ANDROID_SIGNER_SHA256; do
+            test -n "${!name:-}" || { echo "::error::$name is not configured; refusing release signing."; exit 1; }
+          done
+          KEYSTORE="$RUNNER_TEMP/victor-owner-release.jks"
+          printf '%s' "$VICTOR_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+          echo "VICTOR_ANDROID_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+
+      - name: Test and build owner-signed release APK
+        working-directory: android-app
+        run: gradle --no-daemon --stacktrace testDebugUnitTest assembleRelease
+
+      - name: Verify release signer and security boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android-app/app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          AAPT="$BUILD_TOOLS/aapt"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          test -x "$AAPT" && test -x "$APKSIGNER"
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          actual_signer="$($APKSIGNER verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1 | tr 'A-F' 'a-f' | tr -d ':[:space:]')"
+          expected_signer="$(printf '%s' "$VICTOR_ANDROID_SIGNER_SHA256" | tr 'A-F' 'a-f' | tr -d ':[:space:]')"
+          test -n "$actual_signer"
+          test "$actual_signer" = "$expected_signer" || { echo "::error::Release signer identity mismatch."; exit 1; }
+
+          actual="$($AAPT dump permissions "$APK" | sed -n "s/.*name='\([^']*\)'.*/\1/p" | sort -u)"
+          expected="$(cat <<'EOF'
+          android.permission.CAMERA
+          android.permission.FOREGROUND_SERVICE
+          android.permission.FOREGROUND_SERVICE_CAMERA
+          android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION
+          android.permission.FOREGROUND_SERVICE_MICROPHONE
+          android.permission.PACKAGE_USAGE_STATS
+          android.permission.POST_NOTIFICATIONS
+          android.permission.RECORD_AUDIO
+          EOF
+          )"
+          expected="$(printf '%s\n' "$expected" | sed 's/^[[:space:]]*//' | sort -u)"
+          unexpected="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected") || true)"
+          missing="$(comm -13 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected") || true)"
+          test -z "$unexpected" || { echo "::error::Unexpected permissions: $unexpected"; exit 1; }
+          test -z "$missing" || { echo "::error::Missing permissions: $missing"; exit 1; }
+          ! grep -q '^android.permission.INTERNET$' <<<"$actual" || { echo "::error::INTERNET permission forbidden in local-only release."; exit 1; }
+
+          sha256sum "$APK" | tee android-release-sha256.txt
+          printf '%s\n' "$actual_signer" | tee android-release-signer-sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VictorOS-Android-v0.3-owner-signed-release
+          path: |
+            android-app/app/build/outputs/apk/release/app-release.apk
+            android-release-sha256.txt
+            android-release-signer-sha256.txt
+          if-no-files-found: error
+          retention-days: 30

@@ -15,6 +15,12 @@ vos_audit.jsonl
 victor_physiology_receipts.jsonl
 .victor/
 
+# Android owner signing material — never commit private keys or passwords
+*.jks
+*.keystore
+release-signing.properties
+android-signing/
+
 # Pytest
 .pytest_cache/
 
