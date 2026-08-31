@@ -1,5 +1,12 @@
 plugins { id 'com.android.application' }
 
+def releaseStorePath = System.getenv('VICTOR_ANDROID_KEYSTORE_PATH')
+def releaseStorePassword = System.getenv('VICTOR_ANDROID_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('VICTOR_ANDROID_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('VICTOR_ANDROID_KEY_PASSWORD')
+def releaseSigningReady = [releaseStorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+        .every { it != null && !it.trim().isEmpty() }
+
 android {
     namespace 'ai.ethica.victoros'
     compileSdk 35
@@ -15,11 +22,41 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    signingConfigs {
+        if (releaseSigningReady) {
+            ownerRelease {
+                storeFile file(releaseStorePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                v1SigningEnabled true
+                v2SigningEnabled true
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (releaseSigningReady) signingConfig signingConfigs.ownerRelease
         }
+    }
+}
+
+tasks.register('verifyOwnerReleaseSigning') {
+    doLast {
+        if (!releaseSigningReady) {
+            throw new GradleException('Owner release signing is not configured. Refusing to produce a release APK with ephemeral or missing signing identity.')
+        }
+        if (!file(releaseStorePath).isFile()) {
+            throw new GradleException('VICTOR_ANDROID_KEYSTORE_PATH does not point to a keystore file.')
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.named('assembleRelease').configure {
+        dependsOn tasks.named('verifyOwnerReleaseSigning')
     }
 }
 
