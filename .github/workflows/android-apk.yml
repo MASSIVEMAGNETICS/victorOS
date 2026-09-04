@@ -28,6 +28,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+      - name: Verify cognitive-organ source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          ORG="android-app/app/src/main/java/ai/ethica/victoros/VictorCognitiveOrgans.java"
+          UI="android-app/app/src/main/java/ai/ethica/victoros/MainActivity.java"
+          test -s "$ORG"
+          grep -q 'VCSS → VRCO → RAMS → ETHICA → CHOICE → VUEB → CHRONOS → VRCO' "$ORG"
+          grep -q 'NO ON-DEVICE SYNTHESIZED-CODE EXECUTION' "$ORG"
+          grep -q 'INFERRED ≠ VERIFIED ≠ CANONICAL' "$UI"
+          if grep -Eq 'Runtime\.getRuntime\(\)\.exec|ProcessBuilder|\bexec\(' "$ORG"; then
+            echo "Cognitive organ layer must not directly execute synthesized code." >&2
+            exit 1
+          fi
       - name: Test governed core and perception fusion; build debug APK
         working-directory: android-app
         run: gradle --no-daemon --stacktrace testDebugUnitTest assembleDebug
@@ -88,7 +102,7 @@ jobs:
           grep -q 'VictorMicrophoneService' <<<"$manifest" || { echo "Microphone sensory service missing" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: VictorOS-Android-v0.3-Perception-Fusion-debug
+          name: VictorOS-Android-v0.4-Cognitive-Organs-debug
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
