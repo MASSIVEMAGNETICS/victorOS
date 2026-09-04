@@ -4,11 +4,14 @@ Runs as a VOS app inside the launcher (shares the router singleton).
 """
 import json
 import time
+import logging
 
 import psutil
 import requests
 import streamlit as st
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 APP_META = {
     "id": "admin_portal",
@@ -56,8 +59,8 @@ def render(router) -> None:
             r = requests.get("http://localhost:11434/api/tags", timeout=3)
             if r.status_code == 200:
                 ollama_status = "🟢 ONLINE"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Ollama bridge check failed: {e}. Operating in local synthetic mode.")
         st.markdown(f"**Ollama Bridge:** {ollama_status} *(optional — synthetic core is active)*")
 
         audit_count = 0
