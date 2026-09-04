@@ -30,12 +30,14 @@ public final class MainActivity extends Activity {
     private static final int REQ_SCREEN=2001, REQ_CAMERA=2002, REQ_MIC=2003;
     private VictorStore store;
     private VictorPhysiology.Runtime physiology;
+    private VictorCognitiveOrgans cognitive;
     private LinearLayout root;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         store = new VictorStore(this);
         physiology = new VictorPhysiology.Runtime(store, store, VictorPhysiology.setOf("owner","local_user"), Collections.emptySet());
+        cognitive = new VictorCognitiveOrgans(store);
         showHome();
     }
 
@@ -56,25 +58,36 @@ public final class MainActivity extends Activity {
                 "Born " + store.born() + "\nReceipts " + store.events().length() + "  •  Chain " + (store.verify().isEmpty() ? "VERIFIED" : "BROKEN")
                         +"\nHuman STOP "+(p.humanStop?"ACTIVE":"clear")+"  •  Sensory receipt "+shortHash(p.physiologyReceiptHead),
                 p.governanceMode==VictorPhysiology.GovernanceMode.GREEN?GREEN:Color.RED);
+        addPanel("COGNITIVE ORGAN BUS", VictorCognitiveOrgans.ARCHITECTURE
+                + "\nVRCO " + VictorCognitiveOrgans.VRCO_VERSION
+                + "  •  RAMS " + VictorCognitiveOrgans.RAMS_VERSION
+                + "\nArchitecture receipt " + shortHash(cognitive.architectureAttestation()), PURPLE);
         LinearLayout row = null;
         String[][] organs = {
                 {"◉ CORTEX", "Intent and cognition"}, {"▣ MEMORY VAULT", "Persistent experience"},
                 {"⌁ CHRONOS", "Verified causal history"}, {"◇ ETHICA", "Authority and policy"},
                 {"♥ HOMEOSTASIS", "Internal operating state"}, {"⊙ GOD'S EYE", "Shared sensory world"},
+                {"⌘ VRCO", "Relational cognition"}, {"⚙ RAMS", "Governed discovery"},
                 {">_ COMMAND", "Bounded execution"}
         };
         for (int i=0;i<organs.length;i++) {
             if (i%2==0) { row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); root.addView(row, matchWrap()); }
-            final int index=i;
-            Button b = button(organs[i][0] + "\n" + organs[i][1], v -> openOrgan(index), PANEL);
+            Button b = button(organs[i][0] + "\n" + organs[i][1], v -> openOrgan(indexOfButton(v)), PANEL);
+            b.setTag(i);
             LinearLayout.LayoutParams pms = new LinearLayout.LayoutParams(0, dp(112), 1); pms.setMargins(dp(4),dp(4),dp(4),dp(4)); row.addView(b,pms);
         }
+    }
+
+    private int indexOfButton(View view) {
+        Object tag = view.getTag();
+        return tag instanceof Integer ? (Integer) tag : 8;
     }
 
     private void openOrgan(int index) {
         switch(index) {
             case 0: cortex(); break; case 1: memory(); break; case 2: chronos(); break;
-            case 3: ethica(); break; case 4: homeostasis(); break; case 5: godsEye(); break; default: command();
+            case 3: ethica(); break; case 4: homeostasis(); break; case 5: godsEye(); break;
+            case 6: relational(); break; case 7: rams(); break; default: command();
         }
     }
 
@@ -105,7 +118,8 @@ public final class MainActivity extends Activity {
         frame("ETHICA GOVERNOR", true);VictorPhysiology.State s=physiology.state();
         addPanel("PHYSIOLOGY MODE · "+s.governanceMode, s.summary(), s.governanceMode==VictorPhysiology.GovernanceMode.GREEN?GREEN:Color.RED);
         addPanel("ACTIVE CONSTITUTION", "Identity continuity\nHuman STOP authority\nProvenance required\nNo silent canonical overwrite\nNo unauthorized capability escalation\nEvidence before claims\nUnknown is valid\nEvery consequential mutation receives a receipt", GREEN);
-        addPanel("NETWORK AUTHORITY", "ABSENT\nThis v0.2 sensory build still requests no INTERNET permission.", PURPLE);
+        addPanel("COGNITIVE AUTHORITY", "VRCO may INFER and PROPOSE. RAMS may DISCOVER and PROPOSE. Neither may silently canonicalize truth, bypass Ethica, or execute synthesized code. Choice + VUEB + verification remain mandatory.", PURPLE);
+        addPanel("NETWORK AUTHORITY", "ABSENT\nThis local-first build requests no INTERNET permission.", PURPLE);
     }
 
     private void homeostasis() {
@@ -130,7 +144,7 @@ public final class MainActivity extends Activity {
         addButton("OPEN USAGE ACCESS SETTINGS",v->openGovernedSettings(Settings.ACTION_USAGE_ACCESS_SETTINGS,"usage_access_settings"),PURPLE);
         if(usage)addButton("SCAN APP CONTEXT NOW",v->{VictorAppContextSensor.snapshot(this);godsEye();},GREEN);
 
-        addPanel("ACTIVE UI",isAccessibilityEnabled()?"Accessibility perception appears enabled. Victor can inspect the active UI hierarchy; gesture execution remains disabled in v0.2.":"Enable VictorOS in Android Accessibility settings to expose the active UI tree.",isAccessibilityEnabled()?GREEN:PURPLE);
+        addPanel("ACTIVE UI",isAccessibilityEnabled()?"Accessibility perception appears enabled. Victor can inspect the active UI hierarchy; gesture execution remains disabled in this build.":"Enable VictorOS in Android Accessibility settings to expose the active UI tree.",isAccessibilityEnabled()?GREEN:PURPLE);
         addButton("OPEN ACCESSIBILITY SETTINGS",v->openGovernedSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS,"accessibility_settings"),PURPLE);
 
         addPanel("SCREEN EYE", "Android MediaProjection requires a system consent prompt before pixels can be captured.", WHITE);
@@ -144,6 +158,43 @@ public final class MainActivity extends Activity {
 
         addPanel("LATEST PERSISTENT SENSOR RECEIPT",store.latestGodsEyeMetadata(),PURPLE);
         addPanel("LIVE SHARED-SPACE FEED",GodsEyeWorldModel.summary(),WHITE);
+    }
+
+    private void relational() {
+        frame("VRCO · RELATIONAL COGNITION", true);
+        VictorCognitiveOrgans.RelationalReport report = cognitive.scanLocalChronos();
+        addPanel("PAIRWISE / PROCESS SCAN", report.summary(), GREEN);
+        addPanel("AUTHORITY BOUNDARY", "Results are candidate relationships only. INFERRED ≠ VERIFIED ≠ CANONICAL. VRCO cannot bypass Ethica, Choice, VUEB, or Chronos.", PURPLE);
+        addPanel("STRONGEST LOCAL RELATIONS", report.strongestRelations.isEmpty()?"No relation above threshold yet.":join(report.strongestRelations), WHITE);
+        addPanel("RECURRING TRANSITIONS", report.recurringProcesses.isEmpty()?"No repeated transition motif yet.":join(report.recurringProcesses), WHITE);
+        addButton("RUN SCAN + WRITE INFERENCE RECEIPT", v -> {
+            VictorPhysiology.ActionProposal p=proposal("vrco_scan","cognition.relational.scan").consequence(.04).uncertainty(.08).capabilityPower(.05).build();
+            VictorPhysiology.GateDecision d=physiology.execute(p,()->{
+                VictorCognitiveOrgans.RelationalReport fresh=cognitive.scanLocalChronos();
+                store.append("VRCO",fresh.summary()+" strongest="+fresh.strongestRelations,"INFERRED");
+                return "VRCO inference receipt committed: "+shortHash(fresh.receiptDigest);
+            });
+            if(d.executed())relational();else showDecision("VRCO",d);
+        }, GREEN);
+    }
+
+    private void rams() {
+        frame("RAMS · GOVERNED DISCOVERY", true);
+        addPanel("DISCOVERY ORGAN", cognitive.ramsGateSummary(), PURPLE);
+        addPanel("CURRENT APK MODE", "RAMS is intentionally fail-closed. The phone does not exec generated Python/AST payloads and does not treat structural receipt shape as a cryptographic signature.", GREEN);
+        addPanel("ORGAN PATH", VictorCognitiveOrgans.ARCHITECTURE+"\nAttestation "+shortHash(cognitive.architectureAttestation()), WHITE);
+        addPanel("LOCAL SAFETY PREFLIGHT", cognitive.localSafetyPreflight()?"PASS · Chronos receipt chain is trusted":"BLOCKED · local receipt chain is not trusted", cognitive.localSafetyPreflight()?GREEN:Color.RED);
+        addButton("RUN RAMS SAFETY PREFLIGHT + RECEIPT", v -> {
+            VictorPhysiology.ActionProposal p=proposal("rams_preflight","cognition.discovery.preflight").consequence(.03).uncertainty(.05).capabilityPower(.04).build();
+            VictorPhysiology.GateDecision d=physiology.execute(p,()->{
+                boolean pass=cognitive.localSafetyPreflight();
+                if(!pass)throw new IllegalStateException("Chronos ledger is not trusted");
+                String attestation=cognitive.architectureAttestation();
+                store.append("RAMS","Governed discovery preflight passed; synthesized-code execution remains gated; architecture="+shortHash(attestation),"PREFLIGHT");
+                return "RAMS preflight passed. Discovery execution remains gated.";
+            });
+            if(d.executed())rams();else showDecision("RAMS",d);
+        }, GREEN);
     }
 
     private void activateHumanStop(){
@@ -195,22 +246,24 @@ public final class MainActivity extends Activity {
     private String progress(int value) { int blocks=value/10; return "██████████".substring(0,blocks)+"░░░░░░░░░░".substring(0,10-blocks); }
 
     private void command() {
-        frame("COMMAND CENTER", true); addPanel("BOUNDED EXECUTION", "Commands mutate only VictorOS local state and now pass through VictorPhysiologyRuntime before execution.", PURPLE);
-        EditText input=input("remember <text> | focus <0-100> | status | verify"); root.addView(input,matchWrap());
+        frame("COMMAND CENTER", true); addPanel("BOUNDED EXECUTION", "Commands mutate only VictorOS local state and pass through VictorPhysiologyRuntime before execution.", PURPLE);
+        EditText input=input("remember <text> | focus <0-100> | status | verify | scan"); root.addView(input,matchWrap());
         addButton("AUTHORIZE + EXECUTE", v -> execute(input.getText().toString().trim()), GREEN);
     }
 
     private void execute(String cmd) {
         if(cmd.startsWith("remember ")&&cmd.length()>9){String memory=cmd.substring(9);VictorPhysiology.GateDecision d=physiology.execute(proposal("remember","memory.local").consequence(.08).capabilityPower(.08).build(),()->{store.append("MEMORY",memory,"COMMITTED");return "Remembered: "+memory;});showDecision("Command",d);return;}
         if(cmd.startsWith("focus ")){try{int n=Integer.parseInt(cmd.substring(6).trim());if(n<0||n>100)throw new NumberFormatException();VictorPhysiology.GateDecision d=physiology.execute(proposal("set_focus","state.focus").consequence(.05).capabilityPower(.05).build(),()->{store.setMetric("focus",n);return "Focus set to "+n;});showDecision("Command",d);}catch(Exception e){toastDialog("BLOCKED_POLICY","focus must be 0–100");}return;}
-        if(cmd.equals("status")){VictorPhysiology.GateDecision d=physiology.execute(proposal("status","state.read").consequence(.01).capabilityPower(.01).build(),()->"Energy "+store.getMetric("energy",0)+" · Integrity "+store.getMetric("integrity",0)+" · Focus "+store.getMetric("focus",0)+" · Physiology "+physiology.state().governanceMode);showDecision("Command",d);return;}
+        if(cmd.equals("status")){VictorPhysiology.GateDecision d=physiology.execute(proposal("status","state.read").consequence(.01).capabilityPower(.01).build(),()->"Energy "+store.getMetric("energy",0)+" · Integrity "+store.getMetric("integrity",0)+" · Focus "+store.getMetric("focus",0)+" · Physiology "+physiology.state().governanceMode+" · VRCO "+VictorCognitiveOrgans.VRCO_VERSION+" · RAMS "+VictorCognitiveOrgans.RAMS_VERSION);showDecision("Command",d);return;}
         if(cmd.equals("verify")){VictorPhysiology.GateDecision d=physiology.execute(proposal("verify","chronos.verify").consequence(.01).capabilityPower(.01).build(),()->store.verify().isEmpty()?"Chronos chain verified":"Chronos chain failed");showDecision("Command",d);return;}
+        if(cmd.equals("scan")){relational();return;}
         toastDialog("BLOCKED_AUTHORITY","Rejected: command is outside the current capability vocabulary.");
     }
 
     private VictorPhysiology.ActionProposal.Builder proposal(String name,String capability){return VictorPhysiology.ActionProposal.builder(name,capability).provenance("local-owner-ui").requireAuthority("local_user");}
     private void showDecision(String title,VictorPhysiology.GateDecision d){String body="status="+d.status+"\nrisk="+String.format(java.util.Locale.US,"%.3f",d.riskScore)+"\nreasons="+d.reasons+(d.actualOutcome==null?"":"\noutcome="+d.actualOutcome);toastDialog(title,body);}
     private String shortHash(String h){if(h==null)return "none";return h.length()>16?h.substring(0,16)+"…":h;}
+    private String join(List<String> items){StringBuilder out=new StringBuilder();for(String item:items){if(out.length()>0)out.append("\n");out.append("• ").append(item);}return out.toString();}
     private EditText input(String hint) { EditText e=new EditText(this); e.setHint(hint); e.setHintTextColor(Color.GRAY); e.setTextColor(WHITE); e.setBackgroundColor(PANEL); e.setPadding(dp(14),dp(14),dp(14),dp(14)); e.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE); return e; }
     private void addPanel(String heading,String body,int accent) { LinearLayout p=new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(dp(14),dp(14),dp(14),dp(14)); p.setBackgroundColor(PANEL); TextView h=text(heading,15,accent); h.setTypeface(Typeface.DEFAULT_BOLD); p.addView(h); p.addView(text(body,13,WHITE)); LinearLayout.LayoutParams lp=matchWrap(); lp.setMargins(0,dp(5),0,dp(7)); root.addView(p,lp); }
     private void addButton(String label,View.OnClickListener action,int color) { Button b=button(label,action,color); LinearLayout.LayoutParams p=matchWrap(); p.setMargins(0,dp(6),0,dp(6)); root.addView(b,p); }
