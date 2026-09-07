@@ -171,8 +171,9 @@ public final class MainActivity extends Activity {
             VictorPhysiology.ActionProposal p=proposal("vrco_scan","cognition.relational.scan").consequence(.04).uncertainty(.08).capabilityPower(.05).build();
             VictorPhysiology.GateDecision d=physiology.execute(p,()->{
                 VictorCognitiveOrgans.RelationalReport fresh=cognitive.scanLocalChronos();
-                store.append("VRCO",fresh.summary()+" strongest="+fresh.strongestRelations,"INFERRED");
-                return "VRCO inference receipt committed: "+shortHash(fresh.receiptDigest);
+                String committedReceiptHash=store.append("VRCO",fresh.summary()+" strongest="+fresh.strongestRelations,"INFERRED");
+                return "VRCO inference receipt committed: "+shortHash(committedReceiptHash)
+                        +" · scan digest "+shortHash(fresh.receiptDigest);
             });
             if(d.executed())relational();else showDecision("VRCO",d);
         }, GREEN);
