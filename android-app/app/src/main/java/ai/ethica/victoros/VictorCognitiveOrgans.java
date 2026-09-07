@@ -249,7 +249,7 @@ public final class VictorCognitiveOrgans {
         Set<String> out = new HashSet<>();
         for (String raw : text.toLowerCase(Locale.US).split("[^a-z0-9_'-]+")) {
             String token = raw.replace("'", "");
-            if (token.length() < 3 || STOP.contains(token)) continue;
+            if ((token.length() < 3 && !NEGATORS.contains(token)) || STOP.contains(token)) continue;
             out.add(token);
         }
         return out;
@@ -263,7 +263,7 @@ public final class VictorCognitiveOrgans {
         return union == 0 ? 0.0 : ((double) intersection / (double) union);
     }
 
-    private static boolean hasNegation(String text) {
+    static boolean hasNegation(String text) {
         Set<String> ts = tokens(text);
         for (String n : NEGATORS) if (ts.contains(n)) return true;
         return false;
