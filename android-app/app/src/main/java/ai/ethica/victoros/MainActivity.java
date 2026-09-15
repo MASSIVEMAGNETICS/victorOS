@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.media.projection.MediaProjectionManager;
@@ -16,6 +18,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -28,6 +31,7 @@ public final class MainActivity extends Activity {
     private static final int BG = Color.rgb(5, 6, 7), PANEL = Color.rgb(18, 21, 24);
     private static final int GREEN = Color.rgb(168, 255, 53), PURPLE = Color.rgb(183, 92, 255), WHITE = Color.rgb(238, 242, 244);
     private static final int REQ_SCREEN=2001, REQ_CAMERA=2002, REQ_MIC=2003;
+    private static final long CAMERA_PREVIEW_REFRESH_MS=500L;
     private VictorStore store;
     private VictorPhysiology.Runtime physiology;
     private VictorCognitiveOrgans cognitive;
@@ -151,6 +155,11 @@ public final class MainActivity extends Activity {
         addButton("START SCREEN EYE",v->requestScreenEye(),GREEN);addButton("STOP SCREEN EYE",v->stopSensor(VictorScreenCaptureService.class,"sensor.screen.stop"),PURPLE);
 
         addPanel("CAMERA EYE",checkSelfPermission(Manifest.permission.CAMERA)==PackageManager.PERMISSION_GRANTED?"Camera permission granted":"Camera permission required",WHITE);
+        if(s.humanStop) {
+            addPanel("LIVE CAMERA PREVIEW", "Blocked by Human STOP. Ephemeral camera pixels are unavailable until the owner explicitly resets Human STOP.", Color.RED);
+        } else {
+            addLiveCameraPreview();
+        }
         addButton("START CAMERA EYE",v->requestCameraEye(),GREEN);addButton("STOP CAMERA EYE",v->stopSensor(VictorCameraService.class,"sensor.camera.stop"),PURPLE);
 
         addPanel("MICROPHONE EAR",checkSelfPermission(Manifest.permission.RECORD_AUDIO)==PackageManager.PERMISSION_GRANTED?"Microphone permission granted":"Microphone permission required",WHITE);
@@ -158,6 +167,34 @@ public final class MainActivity extends Activity {
 
         addPanel("LATEST PERSISTENT SENSOR RECEIPT",store.latestGodsEyeMetadata(),PURPLE);
         addPanel("LIVE SHARED-SPACE FEED",GodsEyeWorldModel.summary(),WHITE);
+    }
+
+    private void addLiveCameraPreview() {
+        addPanel("LIVE CAMERA PREVIEW", "RAM-only render of the newest bounded CAMERA JPEG. Nothing new is persisted by this view. Refresh stops automatically when this view leaves the screen or Human STOP activates.", PURPLE);
+        ImageView preview = new ImageView(this);
+        preview.setAdjustViewBounds(true);
+        preview.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        preview.setBackgroundColor(Color.BLACK);
+        preview.setContentDescription("God's Eye live camera preview");
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(300));
+        params.setMargins(0, dp(4), 0, dp(8));
+        root.addView(preview, params);
+        refreshCameraPreview(preview);
+    }
+
+    private void refreshCameraPreview(ImageView preview) {
+        if(!preview.isAttachedToWindow()) return;
+        VictorPhysiology.State current=physiology.state();
+        if(current.humanStop) {
+            preview.setImageDrawable(null);
+            return;
+        }
+        byte[] frame=GodsEyeWorldModel.latestBinary("CAMERA");
+        if(frame!=null&&frame.length>0) {
+            Bitmap bitmap=BitmapFactory.decodeByteArray(frame,0,frame.length);
+            if(bitmap!=null) preview.setImageBitmap(bitmap);
+        }
+        preview.postDelayed(() -> refreshCameraPreview(preview), CAMERA_PREVIEW_REFRESH_MS);
     }
 
     private void relational() {
