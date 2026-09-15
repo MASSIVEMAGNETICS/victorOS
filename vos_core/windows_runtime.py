@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,89 @@ def _sha256_text(value: str) -> str:
 
 class StateCorruptionError(RuntimeError):
     """Raised when the persistent Windows state cannot be trusted."""
+
+
+class RuntimeAlreadyActiveError(RuntimeError):
+    """Raised when another process already owns this Victor state directory."""
+
+
+class SingleInstanceStateLock:
+    """Process-lifetime exclusive lock for one Victor state directory.
+
+    The lock file itself is persistent, but the byte/file lock is owned by the
+    live process and released automatically by the OS if that process dies.
+    This prevents a second Victor instance from running crash recovery against
+    work that a first instance is still actively processing.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+b")
+        try:
+            self._acquire()
+        except Exception:
+            self._handle.close()
+            self._handle = None
+            raise
+
+    def _acquire(self) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            self._handle.seek(0, os.SEEK_END)
+            if self._handle.tell() == 0:
+                self._handle.write(b"\0")
+                self._handle.flush()
+            self._handle.seek(0)
+            try:
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeAlreadyActiveError(
+                    f"Victor state is already owned by another live process: {self.path}"
+                ) from exc
+            return
+
+        import fcntl
+
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeAlreadyActiveError(
+                f"Victor state is already owned by another live process: {self.path}"
+            ) from exc
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        finally:
+            handle.close()
+
+    def __enter__(self) -> "SingleInstanceStateLock":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class AtomicJSONState:
@@ -171,6 +255,12 @@ class VictorWindowsRuntime:
         self.workdir = Path(workdir).resolve()
         self.state_dir = self.workdir / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        # Acquire before reading/recovering any shared state. A second live
+        # process must fail closed instead of requeueing the first process's
+        # PROCESSING cognition or racing the single macrotick/receipt chain.
+        self.instance_lock = SingleInstanceStateLock(
+            self.state_dir / "windows_runtime.lock"
+        )
         self.state_store = AtomicJSONState(self.state_dir / "windows_state.json")
         self.startup_fault: Optional[str] = None
         self.state_writable = True
@@ -231,6 +321,16 @@ class VictorWindowsRuntime:
     def _save_state_if_safe(self) -> None:
         if self.state_writable:
             self.state_store.save(self.state)
+
+    def close(self) -> None:
+        """Release the process-lifetime state lock for controlled shutdown/tests."""
+        self.instance_lock.close()
+
+    def __enter__(self) -> "VictorWindowsRuntime":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def status(self) -> Dict[str, Any]:
         return {
