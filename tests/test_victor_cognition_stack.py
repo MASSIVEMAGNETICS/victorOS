@@ -6,20 +6,16 @@
 # purpose: drift gate. zero third-party deps. zero LLMs. stdlib unittest only.
 # =============================================================================
 
-import importlib.util
 import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-SPEC = importlib.util.spec_from_file_location(
-    "victor_cognition_stack", HERE / "victor_cognition_stack.py"
-)
-STACK_MOD = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(STACK_MOD)
-VictorCognitionStack = STACK_MOD.VictorCognitionStack
+from vos_core.victor_cognition_stack import VictorCognitionStack
+
+ROOT = Path(__file__).resolve().parents[1]
+STACK_PATH = ROOT / "vos_core" / "victor_cognition_stack.py"
 
 STDLIB_ALLOWED = {
     "argparse", "hashlib", "json", "re", "sqlite3", "datetime", "pathlib"
@@ -36,7 +32,7 @@ class TestVictorCognitionStack(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_00_zero_third_party_imports(self):
-        src = (HERE / "victor_cognition_stack.py").read_text(encoding="utf-8")
+        src = STACK_PATH.read_text(encoding="utf-8")
         mods = set()
         for m in re.finditer(r"^\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)", src, re.M):
             mods.add(m.group(1))
@@ -127,7 +123,7 @@ class TestVictorCognitionStack(unittest.TestCase):
     def test_09_tick_persists_across_reopen(self):
         self.stack.cycle("Victor memory tick persistence.")
         tick=self.stack.tick
-        reopened=VictorCognitionStack(str(self.db_path))
+        reopened=VictorCognitionStack(str(self.db))
         self.assertEqual(reopened.tick,tick)
 
     def test_10_external_tick_cannot_move_backward(self):
