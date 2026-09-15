@@ -1,8 +1,7 @@
-"""Windows-specific VictorOS prototype runtime.
+"""Windows VictorOS prototype runtime with persistent cognition.
 
-This module is intentionally local-first and deterministic. It composes the
-existing Victor cognitive core with the constitutional physiology gate, a
-persistent state file, and hash-linked episode/receipt ledgers.
+Owner input is accepted through the physiology gate, converted into a durable
+scheduler query, and advanced by non-recursive macroticks.
 """
 from __future__ import annotations
 
@@ -13,18 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from .core_router import CORERouter
+from .cognitive_scheduler import CognitiveScheduler
 from .physiology import (
     ActionProposal,
-    DecisionStatus,
-    GovernanceMode,
     PhysiologyReceiptLedger,
     VictorPhysiologyRuntime,
     VictorPhysiologyState,
 )
+from .victor_cognition_stack import VictorCognitionStack
 
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 
 def _now_iso() -> str:
@@ -68,6 +66,8 @@ class AtomicJSONState:
             raise StateCorruptionError(f"state_unreadable:{type(exc).__name__}") from exc
         if not isinstance(data, dict):
             raise StateCorruptionError("state_root_not_object")
+        if data.get("schema_version") == 1:
+            data["schema_version"] = STATE_SCHEMA_VERSION
         if data.get("schema_version") != STATE_SCHEMA_VERSION:
             raise StateCorruptionError("unsupported_state_schema")
         for key in ("boot_count", "episode_count"):
@@ -191,10 +191,18 @@ class VictorWindowsRuntime:
             receipt_ledger=self.receipts,
             granted_authorities=("local_owner",),
         )
-        self.router = CORERouter(str(self.workdir))
+        self.stack = VictorCognitionStack(db_path=self.state_dir / "victor_stack.db")
+        self.scheduler = CognitiveScheduler(
+            stack=self.stack,
+            physiology=self.physiology,
+            db_path=self.state_dir / "victor_stack.db",
+        )
 
         if not self.episodes.verify_integrity():
             self.startup_fault = self.startup_fault or "episode_ledger_integrity_failure"
+        if not self.scheduler.verify_receipts():
+            self.startup_fault = self.startup_fault or "scheduler_receipt_integrity_failure"
+        if self.startup_fault:
             self.physiology.state.security_pressure = 1.0
             self.physiology.state.recompute_mode()
 
@@ -205,6 +213,9 @@ class VictorWindowsRuntime:
                 "boot_count": self.state["boot_count"],
                 "human_stop": self.physiology.state.human_stop,
                 "episode_chain_ok": self.episodes.verify_integrity(),
+                "scheduler_receipts_ok": self.scheduler.verify_receipts(),
+                "scheduler_tick": self.scheduler.current_tick,
+                "queue_pending": self.scheduler.queue.pending_count(),
                 "startup_fault": self.startup_fault,
             },
         )
@@ -224,6 +235,10 @@ class VictorWindowsRuntime:
             "governance_mode": self.physiology.state.governance_mode.value,
             "receipt_chain_ok": self.receipts.verify_integrity(),
             "episode_chain_ok": self.episodes.verify_integrity(),
+            "scheduler_receipt_chain_ok": self.scheduler.verify_receipts(),
+            "scheduler_tick": self.scheduler.current_tick,
+            "stack_tick": self.stack.tick,
+            "cognitive_queue_pending": self.scheduler.queue.pending_count(),
             "last_receipt": self.physiology.state.physiology_receipt_head,
             "startup_fault": self.startup_fault,
             "state_writable": self.state_writable,
@@ -239,54 +254,55 @@ class VictorWindowsRuntime:
         return {"human_stop": bool(enabled), "governance_mode": mode.value}
 
     def process_episode(self, text: str) -> Dict[str, Any]:
-        text = (text or "").strip()
+        text=(text or "").strip()
         if not text:
             raise ValueError("Episode input cannot be empty.")
-
-        proposal = ActionProposal(
-            name="process_owner_input",
-            capability="cognition.local",
+        proposal=ActionProposal(
+            name="enqueue_owner_query",
+            capability="cognition.enqueue_query",
             provenance="windows-prototype-owner-input",
             required_authorities=("local_owner",),
-            consequence=0.05,
-            irreversibility=0.0,
-            uncertainty=0.15,
-            novelty=0.20,
-            arousal=0.0,
-            urgency=0.0,
-            capability_power=0.10,
-            metadata={
-                "input_sha256": _sha256_text(text),
-                "input_length": len(text),
-            },
+            consequence=0.02, irreversibility=0.0, uncertainty=0.02,
+            novelty=0.05, arousal=0.0, urgency=0.0, capability_power=0.03,
+            metadata={"input_sha256":_sha256_text(text),"input_length":len(text)},
         )
-        decision = self.physiology.execute(
-            proposal,
-            lambda: self.router.synthetic.process(text, context=text),
+        decision=self.physiology.execute(
+            proposal, lambda:self.scheduler.publish_query(text,priority=1.0)
         )
-
-        cognitive: Optional[Dict[str, Any]] = None
+        tick_receipt=None
+        event_id=None
         if decision.actual_outcome and decision.actual_outcome.get("ok"):
-            result = decision.actual_outcome.get("result")
-            if isinstance(result, dict):
-                cognitive = result
-
-        episode = self.episodes.append(
-            {
-                "input": text,
-                "input_sha256": _sha256_text(text),
-                "status": decision.status.value,
-                "governance_mode": decision.governance_mode.value,
-                "reasons": list(decision.reasons),
-                "receipt_hash": decision.receipt_hash,
-                "cognitive": cognitive,
-            }
-        )
-        self.state["episode_count"] = int(self.state.get("episode_count", 0)) + 1
-        self.state["human_stop"] = self.physiology.state.human_stop
-        self.state["last_receipt"] = decision.receipt_hash
+            event_id=str(decision.actual_outcome.get("result"))
+            tick_receipt=self.scheduler.tick(max_items=1)
+        episode=self.episodes.append({
+            "input":text,
+            "input_sha256":_sha256_text(text),
+            "status":decision.status.value,
+            "governance_mode":decision.governance_mode.value,
+            "reasons":list(decision.reasons),
+            "receipt_hash":decision.receipt_hash,
+            "scheduler_event_id":event_id,
+            "scheduler_tick_receipt":tick_receipt,
+        })
+        self.state["episode_count"]=int(self.state.get("episode_count",0))+1
+        self.state["human_stop"]=self.physiology.state.human_stop
+        self.state["last_receipt"]=decision.receipt_hash
         self._save_state_if_safe()
         return episode
 
+    def advance_cognition(self,ticks:int=1)->List[Dict[str,Any]]:
+        if ticks<1 or ticks>20:
+            raise ValueError("ticks must be between 1 and 20")
+        receipts=[self.scheduler.tick() for _ in range(ticks)]
+        self.state["last_receipt"]=self.physiology.state.physiology_receipt_head
+        self._save_state_if_safe()
+        return receipts
+
+    def pending_cognition(self,limit:int=25)->List[Dict[str,Any]]:
+        return self.scheduler.queue.pending_items(limit)
+
     def recent_episodes(self, limit: int = 20) -> List[Dict[str, Any]]:
         return self.episodes.recent(limit)
+
+    def proposed_actions(self) -> List[Dict[str, Any]]:
+        return [a for a in self.stack.actions() if a.get("status") == "proposed"]
