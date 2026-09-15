@@ -203,8 +203,13 @@ class VictorWindowsRuntime:
         if not self.scheduler.verify_receipts():
             self.startup_fault = self.startup_fault or "scheduler_receipt_integrity_failure"
         if self.startup_fault:
+            # Integrity failure is not merely "high pressure". It invalidates the
+            # authority substrate, so force the existing constitutional Human STOP
+            # boundary and persist it when the state store itself is still writable.
             self.physiology.state.security_pressure = 1.0
-            self.physiology.state.recompute_mode()
+            self.physiology.set_human_stop(True)
+            self.state["human_stop"] = True
+            self._save_state_if_safe()
 
         self.state["boot_count"] = int(self.state.get("boot_count", 0)) + 1
         boot_receipt = self.receipts.append(
