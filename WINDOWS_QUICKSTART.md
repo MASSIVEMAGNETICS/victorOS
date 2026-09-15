@@ -1,42 +1,64 @@
-# VictorOS Windows Prototype
+# VictorOS Windows Cognitive Prototype
 
 This is the dedicated Windows owner shell for the active `MASSIVEMAGNETICS/victorOS` core.
 
-## Run it
+## Run
 
-1. Use Windows 10 or 11 with Python 3.10+ installed.
-2. Download or clone this repository.
-3. Double-click `RUN_VICTOR_WINDOWS.bat`.
-4. Victor creates an isolated `.venv`, installs the pinned requirements, opens `http://127.0.0.1:8500`, and boots the local prototype.
+1. Windows 10 or 11.
+2. Install Python 3.10+.
+3. Download/clone this PR branch.
+4. Double-click `RUN_VICTOR_WINDOWS.bat`.
+5. Open `http://127.0.0.1:8500` if the browser does not open automatically.
 
-No cloud API key is required. The server binds to `127.0.0.1` only.
+The service binds to localhost only.
 
-## What is real in this prototype
+## Cognitive mechanism
 
-- Persistent local state in `state/windows_state.json`.
-- Persistent owner episodes in `state/windows_episodes.jsonl`.
-- SHA-256 hash-linked episode integrity verification.
-- Existing `VictorPhysiologyRuntime` constitutional gates and capability leases.
-- Existing SHA-256 physiology receipt ledger in `state/windows_receipts.jsonl`.
-- Explicit Human STOP; when active, the physiology runtime rejects governed execution.
-- Human STOP survives a Windows prototype restart through the state file.
-- Corrupt episode/state evidence causes fail-closed behavior rather than silent repair.
+```text
+owner query
+  -> event bus
+  -> persistent SQLite cognitive queue
+  -> macrotick
+  -> VictorCognitionStack
+  -> follow-up thought
+  -> queue
+  -> later macrotick
+  -> Choice ranking
+  -> VictorPhysiology / Ethica / authority lease
+  -> bounded capability
+  -> receipt
+```
 
-## What this does **not** claim
+A thought does not recursively invoke another thought. It emits future cognitive work into the queue.
 
-This is a governed prototype shell, not evidence of AGI, consciousness, autonomous general intelligence, or a finished operating system. The current local synthetic core performs bounded deterministic cognition/routing and emits structured cognitive telemetry.
+## Persistence
+
+Generated under `state/`:
+
+- `windows_state.json` — Windows prototype state + persistent Human STOP
+- `windows_episodes.jsonl` — hash-linked owner episodes
+- `windows_receipts.jsonl` — physiology/governance receipts
+- `victor_stack.db` — Victor cognition memory, goals, actions, persistent scheduler queue, macrotick state, and scheduler receipts
 
 ## Acceptance test
 
-1. Double-click `RUN_VICTOR_WINDOWS.bat`.
-2. Confirm the browser opens the Windows prototype.
-3. Commit an owner input and verify an episode plus receipt appears.
-4. Close the terminal and run the batch file again; confirm boot/episode counts persist.
-5. Activate Human STOP; confirm input is disabled and governance becomes `BLACK`.
-6. Close and restart; confirm Human STOP is still active.
-7. Explicitly reset Human STOP; confirm processing resumes only after the reset.
-8. Verify `state/windows_episodes.jsonl` and `state/windows_receipts.jsonl` remain intact.
+1. Launch Victor.
+2. Submit: `Victor memory unfinished thought test.`
+3. Confirm the first tick processes the query and leaves at least one pending `THOUGHT`.
+4. Close Victor completely.
+5. Launch it again.
+6. Confirm the pending item is still present and the scheduler/stack clocks did not reset.
+7. Click **Advance 1 Tick**.
+8. Confirm the pending thought is processed.
+9. Activate **Human STOP**.
+10. Create work that reaches a capability candidate and confirm execution is rejected.
+11. Restart with STOP active and confirm it remains active.
+12. Confirm all three receipt/integrity indicators remain OK.
 
-## Recovery rule
+## Failure rule
 
-Do **not** delete the `state/` directory to bypass an integrity fault. Preserve the evidence first, diagnose the corrupt ledger/state, and restore from a known-good copy or a verified migration path.
+Do not delete `state/` to make a failed integrity check disappear. Preserve the evidence, diagnose the broken chain/state, and restore through a verified recovery path.
+
+## Scope
+
+This is a governed local prototype. It is not a claim of AGI or consciousness. The current capability registry is intentionally narrow; Empire-wide authority should ultimately route through the canonical `victor_empire` control plane rather than creating a second authority system here.
