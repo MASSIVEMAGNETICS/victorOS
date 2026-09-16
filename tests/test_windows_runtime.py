@@ -75,3 +75,17 @@ def test_episode_tamper_forces_fail_closed_mode_on_restart(tmp_path):
     assert status["startup_fault"]=="episode_ledger_integrity_failure"
     assert status["governance_mode"]=="BLACK"
     restarted.close()
+
+
+def test_process_closed_loop_episode_reaches_quiescence(tmp_path):
+    r=VictorWindowsRuntime(str(tmp_path))
+    result=r.process_closed_loop_episode("Victor memory runtime heartbeat.",max_ticks=8)
+    assert result["episode"]["status"]=="EXECUTED"
+    assert result["loop"]["quiescent"] is True
+    assert result["loop"]["pending"]==0
+    assert result["loop"]["ticks"]==3
+    assert result["status"]["cognitive_queue_pending"]==0
+    assert r.episodes.verify_integrity()
+    assert r.receipts.verify_integrity()
+    assert r.scheduler.verify_receipts()
+    r.close()

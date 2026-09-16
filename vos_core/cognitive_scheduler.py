@@ -47,6 +47,7 @@ class ItemKind(str, Enum):
     PREDICTION = "PREDICTION"
     REFLECTION = "REFLECTION"
     ACTION_CANDIDATE = "ACTION_CANDIDATE"
+    OBSERVATION = "OBSERVATION"
 
 class ItemStatus(str, Enum):
     PENDING = "PENDING"
@@ -274,13 +275,16 @@ class CognitiveScheduler:
     def _ingest_event(self,event_type,payload):
         mapping={"query":ItemKind.QUERY,"conflict":ItemKind.CONFLICT,
           "prediction_expired":ItemKind.PREDICTION,"goal_unsatisfied":ItemKind.GOAL,
-          "sensor_change":ItemKind.THOUGHT}
+          "sensor_change":ItemKind.THOUGHT,"action_observation":ItemKind.OBSERVATION}
+        depth=max(0,int(payload.get("_depth",0)))
+        parent_id=payload.get("_parent_id")
+        content={k:v for k,v in payload.items() if not str(k).startswith("_")}
         self.queue.push(CognitiveItem(
           id=payload.get("event_id") or uuid.uuid4().hex,
           kind=mapping.get(event_type,ItemKind.THOUGHT),
-          content={"event_type":event_type,**payload},
+          content={"event_type":event_type,**content},
           priority=max(0.0,min(1.0,float(payload.get("priority",0.5)))),
-          depth=0,parent_id=None,created_tick=self.current_tick))
+          depth=depth,parent_id=parent_id,created_tick=self.current_tick))
 
     def _retrieve_context(self,item):
         query=str(item.content.get("text") or item.content.get("step") or item.content.get("event_type") or _canonical_json(item.content))
@@ -303,7 +307,23 @@ class CognitiveScheduler:
               "priority":max(0.05,item.priority-0.05)})
             return out
 
+        if item.kind==ItemKind.OBSERVATION:
+            out["followup_thoughts"].append({
+              "kind":ItemKind.THOUGHT,
+              "content":{"step":"review_action_observation","origin_item_id":item.id,
+                         "capability":item.content.get("capability"),
+                         "status":item.content.get("status"),
+                         "receipt_hash":item.content.get("receipt_hash"),
+                         "outcome":item.content.get("outcome")},
+              "priority":max(0.05,item.priority-0.05)})
+            return out
+
         if item.kind==ItemKind.THOUGHT:
+            # Observation review is the terminal cognition node for one action chain.
+            # It becomes a real next thought without recursively spawning another
+            # capability execution loop.
+            if item.content.get("step")=="review_action_observation":
+                return out
             action_ids=[int(x) for x in item.content.get("stack_action_ids",[])]
             actions={a["id"]:a for a in self.stack.actions()}
             for aid in action_ids:
@@ -312,7 +332,7 @@ class CognitiveScheduler:
                     out["candidate_actions"].append({
                       "capability":"cognition.queue_human_review",
                       "payload":{"stack_action_id":aid},"score":0.8,
-                      "source_item_id":item.id})
+                      "source_item_id":item.id,"source_depth":item.depth})
             reflection=(f"Scheduler reflection for item {item.id}: "
                         f"{len(context['relevant_memories'])} relevant memories, "
                         f"{len(context['active_goals'])} active goals, "
@@ -320,7 +340,8 @@ class CognitiveScheduler:
             out["candidate_actions"].append({
               "capability":"memory.commit_reflection",
               "payload":{"text":reflection,"item_id":item.id},
-              "score":max(0.1,item.priority-0.15),"source_item_id":item.id})
+              "score":max(0.1,item.priority-0.15),"source_item_id":item.id,
+              "source_depth":item.depth})
         return out
 
     @staticmethod
@@ -347,6 +368,16 @@ class CognitiveScheduler:
             conn.execute("""INSERT INTO capability_results
               (tick,capability,status,payload_json,receipt_hash,created_at) VALUES(?,?,?,?,?,?)""",
               (self.current_tick,capability,d.status.value,_canonical_json(result),d.receipt_hash,_utcnow()))
+        observation_id=uuid.uuid4().hex
+        self.bus.publish("action_observation",{
+          "event_id":observation_id,"capability":capability,"status":d.status.value,
+          "governance_mode":d.governance_mode.value,"reasons":list(d.reasons),
+          "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome,
+          "priority":max(0.05,min(1.0,float(c.get("score",0.5)))),
+          "_depth":int(c.get("source_depth",0))+1,
+          "_parent_id":c.get("source_item_id"),
+        })
+        result["observation_event_id"]=observation_id
         return {"executed":result,"status":d.status.value}
 
     def _write_tick_receipt(self,payload):
@@ -369,6 +400,18 @@ class CognitiveScheduler:
             if _hash_payload({"previous_hash":prev,"payload":payload})!=r["receipt_hash"]: return False
             prev=r["receipt_hash"]
         return True
+
+    def run_until_quiescent(self,max_ticks:int=8,max_items:int=8,max_ms:int=300):
+        if max_ticks<1 or max_ticks>100:
+            raise ValueError("max_ticks must be between 1 and 100")
+        receipts=[]
+        for _ in range(max_ticks):
+            if self.queue.pending_count()==0:
+                break
+            receipts.append(self.tick(max_items=max_items,max_ms=max_ms))
+        pending=self.queue.pending_count()
+        return {"ticks":len(receipts),"quiescent":pending==0,
+                "pending":pending,"receipts":receipts}
 
     def tick(self,max_items:int=8,max_ms:int=300):
         self.current_tick+=1; self._save_tick()
