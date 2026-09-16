@@ -403,6 +403,21 @@ class VictorWindowsRuntime:
         self._save_state_if_safe()
         return receipts
 
+    def run_closed_loop(self,max_ticks:int=8,max_items:int=8,max_ms:int=300)->Dict[str,Any]:
+        """Advance bounded cognition until the durable queue is empty or budget expires."""
+        result=self.scheduler.run_until_quiescent(
+            max_ticks=max_ticks,max_items=max_items,max_ms=max_ms
+        )
+        self.state["last_receipt"]=self.physiology.state.physiology_receipt_head
+        self._save_state_if_safe()
+        return result
+
+    def process_closed_loop_episode(self,text:str,max_ticks:int=8)->Dict[str,Any]:
+        """Owner input -> first tick -> governed action observation -> next thought -> idle."""
+        episode=self.process_episode(text)
+        loop=self.run_closed_loop(max_ticks=max_ticks)
+        return {"episode":episode,"loop":loop,"status":self.status()}
+
     def pending_cognition(self,limit:int=25)->List[Dict[str,Any]]:
         return self.scheduler.queue.pending_items(limit)
 
