@@ -58,3 +58,24 @@ def test_scheduler_receipt_chain_verifies(tmp_path):
     s.tick(max_items=1)
     s.tick(max_items=1)
     assert s.verify_receipts()
+
+
+def test_execution_observation_reenters_queue_and_closes_loop(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    s.publish_query("Victor memory closed loop proof.")
+    first=s.tick(max_items=1)
+    assert first["generated_thoughts"]==1
+    second=s.tick(max_items=1)
+    assert second["execution"]["status"]=="EXECUTED"
+    executed=second["execution"]["executed"]
+    assert executed["receipt_hash"]
+    assert executed["observation_event_id"]
+    pending=s.queue.pending_items()
+    assert len(pending)==1
+    assert pending[0]["kind"]=="OBSERVATION"
+    assert pending[0]["content"]["receipt_hash"]==executed["receipt_hash"]
+    closed=s.run_until_quiescent(max_ticks=4,max_items=1)
+    assert closed["quiescent"] is True
+    assert closed["pending"]==0
+    assert closed["ticks"]==2
+    assert s.verify_receipts()
