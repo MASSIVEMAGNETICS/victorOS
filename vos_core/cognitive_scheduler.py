@@ -140,24 +140,45 @@ class PersistentCognitiveQueue:
                 status TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 receipt_hash TEXT,
+                observation_event_id TEXT UNIQUE,
+                source_item_id TEXT,
+                source_depth INTEGER,
+                priority REAL,
                 created_at TEXT NOT NULL
             );
             """)
+            columns={row["name"] for row in conn.execute("PRAGMA table_info(capability_results)")}
+            for name,definition in (
+                ("observation_event_id","TEXT"),
+                ("source_item_id","TEXT"),
+                ("source_depth","INTEGER"),
+                ("priority","REAL"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE capability_results ADD COLUMN {name} {definition}")
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_capability_observation
+              ON capability_results(observation_event_id)
+              WHERE observation_event_id IS NOT NULL""")
 
-    def push(self, item: CognitiveItem) -> bool:
-        if item.depth > MAX_DEPTH:
+    @staticmethod
+    def _insert_with_conn(conn,item:CognitiveItem)->bool:
+        """Insert one queue item using the caller's transaction."""
+        if item.kind is not ItemKind.OBSERVATION and item.depth>MAX_DEPTH:
             item.status=ItemStatus.DROPPED_DEPTH
             return False
         now=_utcnow()
+        changed=conn.execute("""
+          INSERT OR IGNORE INTO cognitive_queue
+          (id,kind,content_json,priority,depth,parent_id,created_tick,ttl,status,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,(item.id,item.kind.value,_canonical_json(item.content),float(item.priority),
+             int(item.depth),item.parent_id,int(item.created_tick),int(item.ttl),
+             ItemStatus.PENDING.value,now,now)).rowcount
+        return bool(changed)
+
+    def push(self, item: CognitiveItem) -> bool:
         with self._conn() as conn:
-            conn.execute("""
-              INSERT OR IGNORE INTO cognitive_queue
-              (id,kind,content_json,priority,depth,parent_id,created_tick,ttl,status,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,(item.id,item.kind.value,_canonical_json(item.content),float(item.priority),
-                 int(item.depth),item.parent_id,int(item.created_tick),int(item.ttl),
-                 ItemStatus.PENDING.value,now,now))
-        return True
+            return self._insert_with_conn(conn,item)
 
     def pop_budgeted(self,current_tick:int,max_items:int=8,max_ms:int=300)->List[CognitiveItem]:
         start=time.perf_counter(); out=[]
@@ -247,6 +268,7 @@ class CognitiveScheduler:
         self.registry=WindowsCapabilityRegistry(stack)
         self.bus=CognitiveEventBus(); self.bus.subscribe(self._ingest_event)
         self.current_tick=max(self._load_tick(),int(self.stack.tick))
+        self._recover_missing_observations()
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path,timeout=30); conn.row_factory=sqlite3.Row
@@ -318,6 +340,12 @@ class CognitiveScheduler:
               "priority":max(0.05,item.priority-0.05)})
             return out
 
+        if item.kind==ItemKind.ACTION_CANDIDATE:
+            candidate=item.content.get("candidate")
+            if isinstance(candidate,dict):
+                out["candidate_actions"].append(dict(candidate))
+            return out
+
         if item.kind==ItemKind.THOUGHT:
             # Observation review is the terminal cognition node for one action chain.
             # It becomes a real next thought without recursively spawning another
@@ -361,24 +389,54 @@ class CognitiveScheduler:
           urgency=0,capability_power=.10,
           metadata={"scheduler_tick":self.current_tick,"source_item_id":c.get("source_item_id")})
         d=self.physiology.execute(proposal,lambda:self.registry.execute(capability,dict(c.get("payload",{}))))
+        observation_id=uuid.uuid4().hex
         result={"capability":capability,"decision_status":d.status.value,
           "governance_mode":d.governance_mode.value,"reasons":list(d.reasons),
-          "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome}
+          "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome,
+          "observation_event_id":observation_id}
+        observation=CognitiveItem(
+          id=observation_id,kind=ItemKind.OBSERVATION,
+          content={"event_type":"action_observation","capability":capability,
+            "status":d.status.value,"governance_mode":d.governance_mode.value,
+            "reasons":list(d.reasons),"receipt_hash":d.receipt_hash,
+            "outcome":d.actual_outcome},
+          priority=max(0.05,min(1.0,float(c.get("score",0.5)))),
+          depth=int(c.get("source_depth",0))+1,
+          parent_id=c.get("source_item_id"),created_tick=self.current_tick)
         with self._conn() as conn:
             conn.execute("""INSERT INTO capability_results
-              (tick,capability,status,payload_json,receipt_hash,created_at) VALUES(?,?,?,?,?,?)""",
-              (self.current_tick,capability,d.status.value,_canonical_json(result),d.receipt_hash,_utcnow()))
-        observation_id=uuid.uuid4().hex
-        self.bus.publish("action_observation",{
-          "event_id":observation_id,"capability":capability,"status":d.status.value,
-          "governance_mode":d.governance_mode.value,"reasons":list(d.reasons),
-          "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome,
-          "priority":max(0.05,min(1.0,float(c.get("score",0.5)))),
-          "_depth":int(c.get("source_depth",0))+1,
-          "_parent_id":c.get("source_item_id"),
-        })
-        result["observation_event_id"]=observation_id
+              (tick,capability,status,payload_json,receipt_hash,observation_event_id,
+               source_item_id,source_depth,priority,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (self.current_tick,capability,d.status.value,_canonical_json(result),d.receipt_hash,
+               observation_id,c.get("source_item_id"),int(c.get("source_depth",0)),
+               float(c.get("score",0.5)),_utcnow()))
+            if not self.queue._insert_with_conn(conn,observation):
+                raise RuntimeError("durable observation id collision")
         return {"executed":result,"status":d.status.value}
+
+    def _recover_missing_observations(self):
+        """Project legacy committed results into exactly one durable observation."""
+        with self._conn() as conn:
+            rows=conn.execute("""SELECT * FROM capability_results
+              WHERE observation_event_id IS NULL ORDER BY id""").fetchall()
+            for row in rows:
+                result=json.loads(row["payload_json"])
+                observation_id=f"recovered-action-observation-{int(row['id'])}"
+                observation=CognitiveItem(
+                  id=observation_id,kind=ItemKind.OBSERVATION,
+                  content={"event_type":"action_observation",
+                    "capability":row["capability"],"status":row["status"],
+                    "governance_mode":result.get("governance_mode"),
+                    "reasons":list(result.get("reasons") or []),
+                    "receipt_hash":row["receipt_hash"],"outcome":result.get("outcome"),
+                    "recovered":True},
+                  priority=max(0.05,min(1.0,float(row["priority"] or 0.5))),
+                  depth=int(row["source_depth"] or 0)+1,
+                  parent_id=row["source_item_id"],created_tick=int(row["tick"]))
+                self.queue._insert_with_conn(conn,observation)
+                conn.execute("UPDATE capability_results SET observation_event_id=? WHERE id=?",
+                             (observation_id,row["id"]))
 
     def _write_tick_receipt(self,payload):
         with self._conn() as conn:
@@ -416,7 +474,8 @@ class CognitiveScheduler:
     def tick(self,max_items:int=8,max_ms:int=300):
         self.current_tick+=1; self._save_tick()
         receipt={"tick":self.current_tick,"queue_size_start":self.queue.pending_count(),
-          "processed":0,"generated_thoughts":0,"generated_actions":0,"execution":None}
+          "processed":0,"generated_thoughts":0,"generated_actions":0,
+          "deferred_actions":0,"execution":None}
         work=self.queue.pop_budgeted(self.current_tick,max_items,max_ms)
         receipt["processed"]=len(work); candidates=[]
         for item in work:
@@ -433,7 +492,17 @@ class CognitiveScheduler:
             except Exception as exc:
                 self.queue.mark(item.id,ItemStatus.FAILED)
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
-        receipt["execution"]=self._execute(self._choice_rank(candidates))
+        ranked=self._choice_rank(candidates)
+        receipt["execution"]=self._execute(ranked)
+        for candidate in ranked[1:]:
+            deferred=CognitiveItem(
+              id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
+              content={"candidate":candidate},priority=float(candidate.get("score",0.5)),
+              depth=int(candidate.get("source_depth",0)),
+              parent_id=candidate.get("source_item_id"),created_tick=self.current_tick)
+            if not self.queue.push(deferred):
+                raise RuntimeError("failed to persist deferred action candidate")
+            receipt["deferred_actions"]+=1
         receipt["queue_size_end"]=self.queue.pending_count()
         receipt["receipt_hash"]=self._write_tick_receipt({k:v for k,v in receipt.items() if k!="receipt_hash"})
         return receipt

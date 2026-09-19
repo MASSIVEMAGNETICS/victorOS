@@ -83,7 +83,9 @@ def test_process_closed_loop_episode_reaches_quiescence(tmp_path):
     assert result["episode"]["status"]=="EXECUTED"
     assert result["loop"]["quiescent"] is True
     assert result["loop"]["pending"]==0
-    assert result["loop"]["ticks"]==3
+    # The lower-ranked reflection is preserved as a durable action candidate
+    # instead of being discarded when the human-review candidate wins.
+    assert result["loop"]["ticks"]==4
     assert result["status"]["cognitive_queue_pending"]==0
     assert r.episodes.verify_integrity()
     assert r.receipts.verify_integrity()
