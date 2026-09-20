@@ -493,7 +493,6 @@ class CognitiveScheduler:
                 self.queue.mark(item.id,ItemStatus.FAILED)
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
         ranked=self._choice_rank(candidates)
-        receipt["execution"]=self._execute(ranked)
         for candidate in ranked[1:]:
             deferred=CognitiveItem(
               id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
@@ -503,6 +502,10 @@ class CognitiveScheduler:
             if not self.queue.push(deferred):
                 raise RuntimeError("failed to persist deferred action candidate")
             receipt["deferred_actions"]+=1
+        # Persist work that will not be attempted before invoking the selected
+        # capability.  Capability execution may fail or terminate the process;
+        # unattempted candidates must already be durable at that boundary.
+        receipt["execution"]=self._execute(ranked)
         receipt["queue_size_end"]=self.queue.pending_count()
         receipt["receipt_hash"]=self._write_tick_receipt({k:v for k,v in receipt.items() if k!="receipt_hash"})
         return receipt

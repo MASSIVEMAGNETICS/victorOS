@@ -115,6 +115,32 @@ def test_batched_action_candidates_are_deferred_without_false_quiescence(tmp_pat
     assert all(row["observation_event_id"] for row in results)
 
 
+def test_unattempted_candidates_survive_selected_execution_failure(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    for index in range(2):
+        assert s.queue.push(CognitiveItem(
+            id=f"failure-thought-{index}",kind=ItemKind.THOUGHT,
+            content={"step":"batched-failure","stack_action_ids":[]},
+            priority=0.8-index*0.1,depth=1,parent_id=f"query-{index}",
+            created_tick=s.current_tick,
+        ))
+
+    with mock.patch.object(s,"_execute",side_effect=RuntimeError("forced execution failure")):
+        try:
+            s.tick(max_items=8)
+        except RuntimeError as exc:
+            assert "forced execution failure" in str(exc)
+        else:
+            raise AssertionError("selected execution failure must propagate")
+
+    pending=s.queue.pending_items()
+    deferred=[item for item in pending if item["kind"]==ItemKind.ACTION_CANDIDATE.value]
+    assert len(deferred)==1
+    assert deferred[0]["content"]["candidate"]["source_item_id"] in {
+        "failure-thought-0","failure-thought-1"
+    }
+
+
 def test_result_and_observation_insert_rollback_together(tmp_path):
     stack,phys,s=runtime(tmp_path)
     candidate={
