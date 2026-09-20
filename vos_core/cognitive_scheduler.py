@@ -493,19 +493,33 @@ class CognitiveScheduler:
                 self.queue.mark(item.id,ItemStatus.FAILED)
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
         ranked=self._choice_rank(candidates)
-        for candidate in ranked[1:]:
-            deferred=CognitiveItem(
+        selected_action_id=None
+        for index,candidate in enumerate(ranked):
+            durable_action=CognitiveItem(
               id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
               content={"candidate":candidate},priority=float(candidate.get("score",0.5)),
               depth=int(candidate.get("source_depth",0)),
               parent_id=candidate.get("source_item_id"),created_tick=self.current_tick)
-            if not self.queue.push(deferred):
-                raise RuntimeError("failed to persist deferred action candidate")
-            receipt["deferred_actions"]+=1
-        # Persist work that will not be attempted before invoking the selected
-        # capability.  Capability execution may fail or terminate the process;
-        # unattempted candidates must already be durable at that boundary.
-        receipt["execution"]=self._execute(ranked)
+            if not self.queue.push(durable_action):
+                raise RuntimeError("failed to persist action candidate")
+            if index==0:
+                selected_action_id=durable_action.id
+                self.queue.mark(selected_action_id,ItemStatus.PROCESSING)
+            else:
+                receipt["deferred_actions"]+=1
+        # Every candidate, including the selected action, is durable before
+        # capability invocation.  The selected record is a crash-recoverable
+        # execution claim: initialization resets a stranded PROCESSING claim to
+        # PENDING, while an ordinary exception makes it immediately retryable.
+        try:
+            receipt["execution"]=self._execute(ranked)
+        except BaseException:
+            if selected_action_id is not None:
+                self.queue.mark(selected_action_id,ItemStatus.PENDING)
+            raise
+        else:
+            if selected_action_id is not None:
+                self.queue.mark(selected_action_id,ItemStatus.COMPLETED)
         receipt["queue_size_end"]=self.queue.pending_count()
         receipt["receipt_hash"]=self._write_tick_receipt({k:v for k,v in receipt.items() if k!="receipt_hash"})
         return receipt

@@ -115,7 +115,7 @@ def test_batched_action_candidates_are_deferred_without_false_quiescence(tmp_pat
     assert all(row["observation_event_id"] for row in results)
 
 
-def test_unattempted_candidates_survive_selected_execution_failure(tmp_path):
+def test_all_candidates_survive_selected_execution_failure(tmp_path):
     stack,phys,s=runtime(tmp_path)
     for index in range(2):
         assert s.queue.push(CognitiveItem(
@@ -134,11 +134,23 @@ def test_unattempted_candidates_survive_selected_execution_failure(tmp_path):
             raise AssertionError("selected execution failure must propagate")
 
     pending=s.queue.pending_items()
-    deferred=[item for item in pending if item["kind"]==ItemKind.ACTION_CANDIDATE.value]
-    assert len(deferred)==1
-    assert deferred[0]["content"]["candidate"]["source_item_id"] in {
-        "failure-thought-0","failure-thought-1"
-    }
+    durable=[item for item in pending if item["kind"]==ItemKind.ACTION_CANDIDATE.value]
+    assert len(durable)==2
+    assert {
+        item["content"]["candidate"]["source_item_id"] for item in durable
+    }=={"failure-thought-0","failure-thought-1"}
+
+    stack2=VictorCognitionStack(str(tmp_path/"victor_stack.db"))
+    phys2=VictorPhysiologyRuntime(
+        receipt_ledger=PhysiologyReceiptLedger(str(tmp_path/"physiology2.jsonl")),
+        granted_authorities=("local_owner",),
+    )
+    restarted=CognitiveScheduler(stack2,phys2,tmp_path/"victor_stack.db")
+    recovered=[
+        item for item in restarted.queue.pending_items()
+        if item["kind"]==ItemKind.ACTION_CANDIDATE.value
+    ]
+    assert len(recovered)==2
 
 
 def test_result_and_observation_insert_rollback_together(tmp_path):
