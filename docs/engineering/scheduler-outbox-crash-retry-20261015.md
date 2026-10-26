@@ -3,7 +3,7 @@
 Status: PARTIAL RUNTIME MITIGATION (2026-10-26), DRAFT. An in-flight action quarantine is integrated on this branch; the transactional outbox and provider idempotency contract are NOT implemented. Do not merge until exact-head CI and independent review.
 
 ## Confirmed failure window
-The current scheduler persists ACTION_CANDIDATE, calls physiology.execute(), then records capability_results. A process exit after the capability side effect but before result storage strands a PROCESSING item, which startup resets to PENDING, risking duplicate side effects.
+The current scheduler persists ACTION_CANDIDATE, calls physiology.execute(), then records capability_results. A process exit after the capability side effect but before result storage strands a PROCESSING item, which the default-branch startup logic resets to PENDING, risking duplicate side effects.
 
 ## Required contract
 - Persist stable action_id/idempotency_key and canonical payload hash, reject collisions with different payloads.
@@ -21,7 +21,7 @@ The current scheduler persists ACTION_CANDIDATE, calls physiology.execute(), the
 5. Proven non-execution transitions UNKNOWN to READY with recorded evidence.
 6. Fail-closed gating and existing scheduler regression suite remain green.
 
-A runnable isolated SQLite proof of this journal has been created and passed 5 local unit tests, but it has not been integrated into the scheduler. Next: wire execution via action IDs and supply integration crash-injection tests on this branch before PR review.
+The earlier isolated SQLite journal proof passed five local tests, but its transactional outbox has NOT been integrated into the scheduler. The 2026-10-26 runtime change below is a narrower UNKNOWN-state quarantine, not that journal. Next: integrate stable action IDs, provider reconciliation, and deterministic crash-injection tests before PR promotion.
 
 ## 2026-10-26: bounded fail-closed recovery mitigation
 
