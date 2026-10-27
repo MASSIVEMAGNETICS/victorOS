@@ -219,6 +219,14 @@ class PersistentCognitiveQueue:
             return int(conn.execute("SELECT COUNT(*) c FROM cognitive_queue WHERE status=?",
                                     (ItemStatus.PENDING.value,)).fetchone()["c"])
 
+    def unknown_count(self)->int:
+        """Count quarantined capability effects requiring reconciliation."""
+        with self._conn() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) c FROM cognitive_queue WHERE kind=? AND status=?",
+                (ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value),
+            ).fetchone()["c"])
+
     def pending_items(self,limit:int=25)->List[Dict[str,Any]]:
         with self._conn() as conn:
             rows=conn.execute("""
@@ -476,8 +484,10 @@ class CognitiveScheduler:
                 break
             receipts.append(self.tick(max_items=max_items,max_ms=max_ms))
         pending=self.queue.pending_count()
-        return {"ticks":len(receipts),"quiescent":pending==0,
-                "pending":pending,"receipts":receipts}
+        unknown=self.queue.unknown_count()
+        return {"ticks":len(receipts),"quiescent":pending==0 and unknown==0,
+                "pending":pending,"unknown":unknown,
+                "blocked_on_reconciliation":unknown>0,"receipts":receipts}
 
     def tick(self,max_items:int=8,max_ms:int=300):
         self.current_tick+=1; self._save_tick()
