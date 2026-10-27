@@ -52,6 +52,7 @@ class ItemKind(str, Enum):
 class ItemStatus(str, Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
+    UNKNOWN = "UNKNOWN"  # In-flight capability effect; requires reconciliation.
     COMPLETED = "COMPLETED"
     DROPPED_DEPTH = "DROPPED_DEPTH"
     DROPPED_TTL = "DROPPED_TTL"
@@ -89,8 +90,15 @@ class PersistentCognitiveQueue:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
-        # Crash recovery: items claimed before a process died become pending again.
+        # Capability effects may already have happened when the process died.
+        # Quarantine ambiguous action claims; never replay them automatically.
+        # Non-capability cognition can still resume from its pending queue.
         with self._conn() as conn:
+            conn.execute(
+                "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=? AND kind=?",
+                (ItemStatus.UNKNOWN.value, _utcnow(), ItemStatus.PROCESSING.value,
+                 ItemKind.ACTION_CANDIDATE.value),
+            )
             conn.execute(
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
@@ -507,15 +515,15 @@ class CognitiveScheduler:
                 self.queue.mark(selected_action_id,ItemStatus.PROCESSING)
             else:
                 receipt["deferred_actions"]+=1
-        # Every candidate, including the selected action, is durable before
-        # capability invocation.  The selected record is a crash-recoverable
-        # execution claim: initialization resets a stranded PROCESSING claim to
-        # PENDING, while an ordinary exception makes it immediately retryable.
+        # Every candidate is durable before capability invocation. A selected
+        # PROCESSING claim has an ambiguous outcome after a crash or exception:
+        # quarantine it as UNKNOWN until a human/provider reconciles the effect.
+        # This is a fail-closed mitigation, NOT an idempotent transactional outbox.
         try:
             receipt["execution"]=self._execute(ranked)
         except BaseException:
             if selected_action_id is not None:
-                self.queue.mark(selected_action_id,ItemStatus.PENDING)
+                self.queue.mark(selected_action_id,ItemStatus.UNKNOWN)
             raise
         else:
             if selected_action_id is not None:

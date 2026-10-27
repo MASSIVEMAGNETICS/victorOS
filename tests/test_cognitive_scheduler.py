@@ -4,6 +4,8 @@ from vos_core.cognitive_scheduler import (
     CognitiveItem,
     CognitiveScheduler,
     ItemKind,
+    ItemStatus,
+    PersistentCognitiveQueue,
 )
 from vos_core.physiology import PhysiologyReceiptLedger, VictorPhysiologyRuntime
 from vos_core.victor_cognition_stack import VictorCognitionStack
@@ -135,10 +137,16 @@ def test_all_candidates_survive_selected_execution_failure(tmp_path):
 
     pending=s.queue.pending_items()
     durable=[item for item in pending if item["kind"]==ItemKind.ACTION_CANDIDATE.value]
-    assert len(durable)==2
-    assert {
-        item["content"]["candidate"]["source_item_id"] for item in durable
-    }=={"failure-thought-0","failure-thought-1"}
+    # The selected claim is ambiguous and must NOT become retryable.
+    # Only the unselected, never-dispatched candidate remains pending.
+    assert len(durable)==1
+    assert durable[0]["content"]["candidate"]["source_item_id"]=="failure-thought-1"
+    with s._conn() as conn:
+        unknown=conn.execute(
+            "SELECT id FROM cognitive_queue WHERE kind=? AND status=?",
+            (ItemKind.ACTION_CANDIDATE.value,ItemStatus.UNKNOWN.value),
+        ).fetchall()
+    assert len(unknown)==1
 
     stack2=VictorCognitionStack(str(tmp_path/"victor_stack.db"))
     phys2=VictorPhysiologyRuntime(
@@ -150,7 +158,12 @@ def test_all_candidates_survive_selected_execution_failure(tmp_path):
         item for item in restarted.queue.pending_items()
         if item["kind"]==ItemKind.ACTION_CANDIDATE.value
     ]
-    assert len(recovered)==2
+    assert len(recovered)==1
+    with restarted._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE kind=? AND status=?",
+            (ItemKind.ACTION_CANDIDATE.value,ItemStatus.UNKNOWN.value),
+        ).fetchone()[0]==1
 
 
 def test_result_and_observation_insert_rollback_together(tmp_path):
@@ -222,3 +235,68 @@ def test_restart_recovers_legacy_result_observation_exactly_once(tmp_path):
     with restarted._conn() as conn:
         row=conn.execute("SELECT observation_event_id FROM capability_results").fetchone()
     assert row["observation_event_id"]==observations[0]["id"]
+
+
+def test_restart_quarantines_inflight_action_but_recovers_non_action(tmp_path):
+    db=tmp_path/"queue.db"
+    queue=PersistentCognitiveQueue(db)
+    assert queue.push(CognitiveItem(
+        id="ambiguous-action",kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate":{"capability":"memory.commit_reflection",
+                              "payload":{"text":"possibly committed"},"score":0.8}},
+        priority=0.8,depth=1,parent_id="source",created_tick=1,
+    ))
+    assert queue.push(CognitiveItem(
+        id="safe-thought",kind=ItemKind.THOUGHT,
+        content={"step":"review"},priority=0.5,depth=1,
+        parent_id="source",created_tick=1,
+    ))
+    queue.mark("ambiguous-action",ItemStatus.PROCESSING)
+    queue.mark("safe-thought",ItemStatus.PROCESSING)
+
+    recovered=PersistentCognitiveQueue(db)
+    assert [row["id"] for row in recovered.pending_items()]==["safe-thought"]
+    with recovered._conn() as conn:
+        statuses=dict(conn.execute("SELECT id,status FROM cognitive_queue"))
+    assert statuses["ambiguous-action"]==ItemStatus.UNKNOWN.value
+    assert statuses["safe-thought"]==ItemStatus.PENDING.value
+    assert recovered.pop_budgeted(2,max_items=5)[0].id=="safe-thought"
+
+    # A second restart must not requeue the ambiguous capability claim.
+    again=PersistentCognitiveQueue(db)
+    with again._conn() as conn:
+        assert conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id='ambiguous-action'"
+        ).fetchone()[0]==ItemStatus.UNKNOWN.value
+
+
+def test_failed_selected_action_requires_reconciliation_before_retry(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    assert s.queue.push(CognitiveItem(
+        id="single-thought",kind=ItemKind.THOUGHT,
+        content={"step":"review","stack_action_ids":[]},
+        priority=0.8,depth=1,parent_id="source",created_tick=0,
+    ))
+    with mock.patch.object(s,"_execute",side_effect=RuntimeError("ambiguous outcome")):
+        try:
+            s.tick(max_items=1)
+        except RuntimeError as exc:
+            assert "ambiguous outcome" in str(exc)
+        else:
+            raise AssertionError("ambiguous capability outcome must propagate")
+
+    with s._conn() as conn:
+        rows=conn.execute(
+            "SELECT status FROM cognitive_queue WHERE kind=?",
+            (ItemKind.ACTION_CANDIDATE.value,),
+        ).fetchall()
+    assert [r["status"] for r in rows]==[ItemStatus.UNKNOWN.value]
+
+    stack2=VictorCognitionStack(str(tmp_path/"victor_stack.db"))
+    phys2=VictorPhysiologyRuntime(
+        receipt_ledger=PhysiologyReceiptLedger(str(tmp_path/"physiology2.jsonl")),
+        granted_authorities=("local_owner",),
+    )
+    restarted=CognitiveScheduler(stack2,phys2,tmp_path/"victor_stack.db")
+    assert restarted.queue.pending_count()==0
+    assert restarted.run_until_quiescent(max_ticks=2)["ticks"]==0
