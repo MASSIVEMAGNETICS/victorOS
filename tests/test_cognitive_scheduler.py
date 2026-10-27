@@ -300,3 +300,48 @@ def test_failed_selected_action_requires_reconciliation_before_retry(tmp_path):
     restarted=CognitiveScheduler(stack2,phys2,tmp_path/"victor_stack.db")
     assert restarted.queue.pending_count()==0
     assert restarted.run_until_quiescent(max_ticks=2)["ticks"]==0
+
+
+def test_unknown_capability_effect_blocks_quiescence_after_restart(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="unreconciled-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "possibly executed"}, "score": 0.8}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("unreconciled-effect", ItemStatus.PROCESSING)
+    recovered = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    assert recovered.pending_count() == 0
+    assert recovered.unknown_count() == 1
+
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["ticks"] == 0
+    assert report["pending"] == 0
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert report["quiescent"] is False
+
+    restarted = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    assert restarted.unknown_count() == 1
+    assert restarted.pending_count() == 0
+
+
+def test_clean_scheduler_quiescence_has_no_reconciliation_blocker(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["ticks"] == 0
+    assert report["pending"] == 0
+    assert report["unknown"] == 0
+    assert report["blocked_on_reconciliation"] is False
+    assert report["quiescent"] is True
+
+
+def test_unknown_count_only_tracks_ambiguous_capability_effects(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="unknown-thought", kind=ItemKind.THOUGHT, content={"step": "review"},
+        priority=0.5, depth=1, parent_id=None, created_tick=0,
+    ))
+    queue.mark("unknown-thought", ItemStatus.UNKNOWN)
+    assert queue.unknown_count() == 0
