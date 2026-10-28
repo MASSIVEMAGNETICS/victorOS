@@ -227,6 +227,35 @@ class PersistentCognitiveQueue:
                 (ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value),
             ).fetchone()["c"])
 
+    def unknown_effects(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Read-only, payload-redacted reconciliation inventory.
+
+        Counts remain authoritative through unknown_count(); this bounded list
+        never returns capability arguments or authorizes a retry.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, parent_id, created_tick, content_json
+                   FROM cognitive_queue WHERE kind=? AND status=?
+                   ORDER BY created_tick ASC, id ASC LIMIT ?""",
+                (ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value, limit),
+            ).fetchall()
+        effects = []
+        for row in rows:
+            content = json.loads(row["content_json"])
+            candidate = content.get("candidate") if isinstance(content, dict) else None
+            capability = candidate.get("capability") if isinstance(candidate, dict) else None
+            effects.append({
+                "id": row["id"],
+                "parent_id": row["parent_id"],
+                "created_tick": int(row["created_tick"]),
+                "capability": capability if isinstance(capability, str) else None,
+                "content_sha256": _sha256(row["content_json"]),
+            })
+        return effects
+
     def pending_items(self,limit:int=25)->List[Dict[str,Any]]:
         with self._conn() as conn:
             rows=conn.execute("""
@@ -487,6 +516,7 @@ class CognitiveScheduler:
         unknown=self.queue.unknown_count()
         return {"ticks":len(receipts),"quiescent":pending==0 and unknown==0,
                 "pending":pending,"unknown":unknown,
+                "unknown_effects":self.queue.unknown_effects(),
                 "blocked_on_reconciliation":unknown>0,"receipts":receipts}
 
     def tick(self,max_items:int=8,max_ms:int=300):
