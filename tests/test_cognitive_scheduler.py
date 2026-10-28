@@ -345,3 +345,67 @@ def test_unknown_count_only_tracks_ambiguous_capability_effects(tmp_path):
     ))
     queue.mark("unknown-thought", ItemStatus.UNKNOWN)
     assert queue.unknown_count() == 0
+
+def test_unknown_effect_inventory_is_redacted_bounded_and_stable(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    for index in (2, 1):
+        assert queue.push(CognitiveItem(
+            id=f"ambiguous-{index}", kind=ItemKind.ACTION_CANDIDATE,
+            content={"candidate": {"capability": "memory.commit_reflection",
+                                   "payload": {"text": f"private-secret-{index}"}}},
+            priority=0.8, depth=1, parent_id="source", created_tick=index,
+        ))
+        queue.mark(f"ambiguous-{index}", ItemStatus.UNKNOWN)
+    assert queue.unknown_count() == 2
+    first = queue.unknown_effects(limit=1)
+    assert len(first) == 1
+    assert first[0]["id"] == "ambiguous-1"
+    assert first[0]["capability"] == "memory.commit_reflection"
+    assert first[0]["parent_id"] == "source"
+    assert first[0]["created_tick"] == 1
+    assert len(first[0]["content_sha256"]) == 64
+    assert "private-secret" not in str(first)
+    assert "payload" not in str(first)
+    restarted = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert restarted.unknown_effects(limit=1) == first
+    assert [r["id"] for r in restarted.unknown_effects()] == [
+        "ambiguous-1", "ambiguous-2"
+    ]
+    assert restarted.pending_count() == 0
+
+
+def test_unknown_effect_inventory_rejects_invalid_limits_and_non_actions(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="unknown-thought", kind=ItemKind.THOUGHT,
+        content={"step": "private"}, priority=0.5, depth=0,
+        parent_id=None, created_tick=0,
+    ))
+    queue.mark("unknown-thought", ItemStatus.UNKNOWN)
+    assert queue.unknown_effects() == []
+    for bad in (0, -1, 101, True, 1.0, "1", None):
+        try:
+            queue.unknown_effects(limit=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid limit accepted: {bad!r}")
+
+
+def test_quiescence_report_includes_redacted_reconciliation_inventory(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="needs-review", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "do-not-expose"}}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("needs-review", ItemStatus.UNKNOWN)
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["quiescent"] is False
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert len(report["unknown_effects"]) == 1
+    assert report["unknown_effects"][0]["id"] == "needs-review"
+    assert "do-not-expose" not in str(report)
+    assert scheduler.queue.pending_count() == 0
