@@ -409,3 +409,51 @@ def test_quiescence_report_includes_redacted_reconciliation_inventory(tmp_path):
     assert report["unknown_effects"][0]["id"] == "needs-review"
     assert "do-not-expose" not in str(report)
     assert scheduler.queue.pending_count() == 0
+
+
+def test_corrupt_unknown_effect_remains_visible_without_payload_leak(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="corrupt-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "private"}}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("corrupt-effect", ItemStatus.UNKNOWN)
+    # Model on-disk corruption after a crash, not a normal API write.
+    with scheduler._conn() as conn:
+        conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
+                     ("{invalid-private-json", "corrupt-effect"))
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["quiescent"] is False
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert report["pending"] == 0
+    assert report["ticks"] == 0
+    assert len(report["unknown_effects"]) == 1
+    effect = report["unknown_effects"][0]
+    assert effect["id"] == "corrupt-effect"
+    assert effect["capability"] is None
+    assert len(effect["content_sha256"]) == 64
+    assert "invalid-private-json" not in str(report)
+    assert scheduler.queue.unknown_count() == 1
+    assert PersistentCognitiveQueue(tmp_path / "victor_stack.db").unknown_effects() == [effect]
+
+
+def test_unknown_effect_inventory_handles_non_object_json(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="non-object-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection"}},
+        priority=0.8, depth=1, parent_id="source", created_tick=1,
+    ))
+    queue.mark("non-object-effect", ItemStatus.UNKNOWN)
+    with queue._conn() as conn:
+        conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
+                     ('["private-payload"]', "non-object-effect"))
+    effects = queue.unknown_effects()
+    assert len(effects) == 1
+    assert effects[0]["id"] == "non-object-effect"
+    assert effects[0]["capability"] is None
+    assert "private-payload" not in str(effects)
+    assert queue.unknown_count() == 1
