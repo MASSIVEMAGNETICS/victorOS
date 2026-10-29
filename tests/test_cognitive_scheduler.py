@@ -300,3 +300,160 @@ def test_failed_selected_action_requires_reconciliation_before_retry(tmp_path):
     restarted=CognitiveScheduler(stack2,phys2,tmp_path/"victor_stack.db")
     assert restarted.queue.pending_count()==0
     assert restarted.run_until_quiescent(max_ticks=2)["ticks"]==0
+
+
+def test_unknown_capability_effect_blocks_quiescence_after_restart(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="unreconciled-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "possibly executed"}, "score": 0.8}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("unreconciled-effect", ItemStatus.PROCESSING)
+    recovered = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    assert recovered.pending_count() == 0
+    assert recovered.unknown_count() == 1
+
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["ticks"] == 0
+    assert report["pending"] == 0
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert report["quiescent"] is False
+
+    restarted = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    assert restarted.unknown_count() == 1
+    assert restarted.pending_count() == 0
+
+
+def test_clean_scheduler_quiescence_has_no_reconciliation_blocker(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["ticks"] == 0
+    assert report["pending"] == 0
+    assert report["unknown"] == 0
+    assert report["blocked_on_reconciliation"] is False
+    assert report["quiescent"] is True
+
+
+def test_unknown_count_only_tracks_ambiguous_capability_effects(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="unknown-thought", kind=ItemKind.THOUGHT, content={"step": "review"},
+        priority=0.5, depth=1, parent_id=None, created_tick=0,
+    ))
+    queue.mark("unknown-thought", ItemStatus.UNKNOWN)
+    assert queue.unknown_count() == 0
+
+def test_unknown_effect_inventory_is_redacted_bounded_and_stable(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    for index in (2, 1):
+        assert queue.push(CognitiveItem(
+            id=f"ambiguous-{index}", kind=ItemKind.ACTION_CANDIDATE,
+            content={"candidate": {"capability": "memory.commit_reflection",
+                                   "payload": {"text": f"private-secret-{index}"}}},
+            priority=0.8, depth=1, parent_id="source", created_tick=index,
+        ))
+        queue.mark(f"ambiguous-{index}", ItemStatus.UNKNOWN)
+    assert queue.unknown_count() == 2
+    first = queue.unknown_effects(limit=1)
+    assert len(first) == 1
+    assert first[0]["id"] == "ambiguous-1"
+    assert first[0]["capability"] == "memory.commit_reflection"
+    assert first[0]["parent_id"] == "source"
+    assert first[0]["created_tick"] == 1
+    assert len(first[0]["content_sha256"]) == 64
+    assert "private-secret" not in str(first)
+    assert "payload" not in str(first)
+    restarted = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert restarted.unknown_effects(limit=1) == first
+    assert [r["id"] for r in restarted.unknown_effects()] == [
+        "ambiguous-1", "ambiguous-2"
+    ]
+    assert restarted.pending_count() == 0
+
+
+def test_unknown_effect_inventory_rejects_invalid_limits_and_non_actions(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="unknown-thought", kind=ItemKind.THOUGHT,
+        content={"step": "private"}, priority=0.5, depth=0,
+        parent_id=None, created_tick=0,
+    ))
+    queue.mark("unknown-thought", ItemStatus.UNKNOWN)
+    assert queue.unknown_effects() == []
+    for bad in (0, -1, 101, True, 1.0, "1", None):
+        try:
+            queue.unknown_effects(limit=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid limit accepted: {bad!r}")
+
+
+def test_quiescence_report_includes_redacted_reconciliation_inventory(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="needs-review", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "do-not-expose"}}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("needs-review", ItemStatus.UNKNOWN)
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["quiescent"] is False
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert len(report["unknown_effects"]) == 1
+    assert report["unknown_effects"][0]["id"] == "needs-review"
+    assert "do-not-expose" not in str(report)
+    assert scheduler.queue.pending_count() == 0
+
+
+def test_corrupt_unknown_effect_remains_visible_without_payload_leak(tmp_path):
+    stack, phys, scheduler = runtime(tmp_path)
+    assert scheduler.queue.push(CognitiveItem(
+        id="corrupt-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "private"}}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.queue.mark("corrupt-effect", ItemStatus.UNKNOWN)
+    # Model on-disk corruption after a crash, not a normal API write.
+    with scheduler._conn() as conn:
+        conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
+                     ("{invalid-private-json", "corrupt-effect"))
+    report = scheduler.run_until_quiescent(max_ticks=2)
+    assert report["quiescent"] is False
+    assert report["unknown"] == 1
+    assert report["blocked_on_reconciliation"] is True
+    assert report["pending"] == 0
+    assert report["ticks"] == 0
+    assert len(report["unknown_effects"]) == 1
+    effect = report["unknown_effects"][0]
+    assert effect["id"] == "corrupt-effect"
+    assert effect["capability"] is None
+    assert len(effect["content_sha256"]) == 64
+    assert "invalid-private-json" not in str(report)
+    assert scheduler.queue.unknown_count() == 1
+    assert PersistentCognitiveQueue(tmp_path / "victor_stack.db").unknown_effects() == [effect]
+
+
+def test_unknown_effect_inventory_handles_non_object_json(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="non-object-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection"}},
+        priority=0.8, depth=1, parent_id="source", created_tick=1,
+    ))
+    queue.mark("non-object-effect", ItemStatus.UNKNOWN)
+    with queue._conn() as conn:
+        conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
+                     ('["private-payload"]', "non-object-effect"))
+    effects = queue.unknown_effects()
+    assert len(effects) == 1
+    assert effects[0]["id"] == "non-object-effect"
+    assert effects[0]["capability"] is None
+    assert "private-payload" not in str(effects)
+    assert queue.unknown_count() == 1
