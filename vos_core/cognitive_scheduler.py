@@ -244,7 +244,13 @@ class PersistentCognitiveQueue:
             ).fetchall()
         effects = []
         for row in rows:
-            content = json.loads(row["content_json"])
+            # Damaged persisted payloads must not hide an unresolved effect or
+            # prevent operators from inspecting the remaining quarantine queue.
+            # Preserve the raw-content digest for offline reconciliation.
+            try:
+                content = json.loads(row["content_json"])
+            except (ValueError, TypeError):
+                content = None
             candidate = content.get("candidate") if isinstance(content, dict) else None
             capability = candidate.get("capability") if isinstance(candidate, dict) else None
             effects.append({
