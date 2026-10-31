@@ -26,6 +26,16 @@ from .physiology import (
     VictorPhysiologyState,
 )
 from .resonance_ledger import ResonanceLedger, ResonanceVector
+from .native_kernel import (
+    ChronosPromotionAdapter,
+    CandidateGestalt,
+    Episode,
+    ExperienceTransitionCandidate,
+    KernelActionCandidate,
+    NativeKernel,
+    NativeOrganStack,
+    OrganSignal,
+)
 
 __all__ = [
     "GodTierVersion",
@@ -46,4 +56,12 @@ __all__ = [
     "VictorPhysiologyState",
     "ResonanceLedger",
     "ResonanceVector",
+    "ChronosPromotionAdapter",
+    "CandidateGestalt",
+    "Episode",
+    "ExperienceTransitionCandidate",
+    "KernelActionCandidate",
+    "NativeKernel",
+    "NativeOrganStack",
+    "OrganSignal",
 ]
