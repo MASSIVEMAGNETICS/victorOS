@@ -210,9 +210,30 @@ class PersistentCognitiveQueue:
         return out
 
     def mark(self,item_id:str,status:ItemStatus):
+        """Update a claim without releasing an ambiguous capability effect.
+
+        UNKNOWN action claims are terminal for this generic queue API. A future
+        audited reconciliation path must establish the provider outcome before
+        any transition out of quarantine; ordinary cognition is unaffected.
+        The conditional UPDATE prevents a concurrent change from UNKNOWN from
+        being overwritten by a stale caller.
+        """
         with self._conn() as conn:
-            conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
-                         (status.value,_utcnow(),item_id))
+            if status is ItemStatus.UNKNOWN:
+                conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
+                             (status.value,_utcnow(),item_id))
+                return
+            changed=conn.execute("""
+              UPDATE cognitive_queue SET status=?,updated_at=?
+              WHERE id=? AND NOT (kind=? AND status=?)
+            """,(status.value,_utcnow(),item_id,ItemKind.ACTION_CANDIDATE.value,
+                 ItemStatus.UNKNOWN.value)).rowcount
+            if not changed:
+                row=conn.execute("SELECT kind,status FROM cognitive_queue WHERE id=?",
+                                 (item_id,)).fetchone()
+                if (row is not None and row["kind"]==ItemKind.ACTION_CANDIDATE.value
+                        and row["status"]==ItemStatus.UNKNOWN.value):
+                    raise ValueError("quarantined capability effect requires explicit reconciliation")
 
     def pending_count(self)->int:
         with self._conn() as conn:
