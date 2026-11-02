@@ -210,14 +210,78 @@ class PersistentCognitiveQueue:
         return out
 
     def mark(self,item_id:str,status:ItemStatus):
+        """Update a claim without releasing an ambiguous capability effect.
+
+        UNKNOWN action claims are terminal for this generic queue API. A future
+        audited reconciliation path must establish the provider outcome before
+        any transition out of quarantine; ordinary cognition is unaffected.
+        The conditional UPDATE prevents a concurrent change from UNKNOWN from
+        being overwritten by a stale caller.
+        """
         with self._conn() as conn:
-            conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
-                         (status.value,_utcnow(),item_id))
+            if status is ItemStatus.UNKNOWN:
+                conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
+                             (status.value,_utcnow(),item_id))
+                return
+            changed=conn.execute("""
+              UPDATE cognitive_queue SET status=?,updated_at=?
+              WHERE id=? AND NOT (kind=? AND status=?)
+            """,(status.value,_utcnow(),item_id,ItemKind.ACTION_CANDIDATE.value,
+                 ItemStatus.UNKNOWN.value)).rowcount
+            if not changed:
+                row=conn.execute("SELECT kind,status FROM cognitive_queue WHERE id=?",
+                                 (item_id,)).fetchone()
+                if (row is not None and row["kind"]==ItemKind.ACTION_CANDIDATE.value
+                        and row["status"]==ItemStatus.UNKNOWN.value):
+                    raise ValueError("quarantined capability effect requires explicit reconciliation")
 
     def pending_count(self)->int:
         with self._conn() as conn:
             return int(conn.execute("SELECT COUNT(*) c FROM cognitive_queue WHERE status=?",
                                     (ItemStatus.PENDING.value,)).fetchone()["c"])
+
+    def unknown_count(self)->int:
+        """Count quarantined capability effects requiring reconciliation."""
+        with self._conn() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) c FROM cognitive_queue WHERE kind=? AND status=?",
+                (ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value),
+            ).fetchone()["c"])
+
+    def unknown_effects(self, limit: int = 25) -> List[Dict[str, Any]]:
+        """Read-only, payload-redacted reconciliation inventory.
+
+        Counts remain authoritative through unknown_count(); this bounded list
+        never returns capability arguments or authorizes a retry.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, parent_id, created_tick, content_json
+                   FROM cognitive_queue WHERE kind=? AND status=?
+                   ORDER BY created_tick ASC, id ASC LIMIT ?""",
+                (ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value, limit),
+            ).fetchall()
+        effects = []
+        for row in rows:
+            # Damaged persisted payloads must not hide an unresolved effect or
+            # prevent operators from inspecting the remaining quarantine queue.
+            # Preserve the raw-content digest for offline reconciliation.
+            try:
+                content = json.loads(row["content_json"])
+            except (ValueError, TypeError):
+                content = None
+            candidate = content.get("candidate") if isinstance(content, dict) else None
+            capability = candidate.get("capability") if isinstance(candidate, dict) else None
+            effects.append({
+                "id": row["id"],
+                "parent_id": row["parent_id"],
+                "created_tick": int(row["created_tick"]),
+                "capability": capability if isinstance(capability, str) else None,
+                "content_sha256": _sha256(row["content_json"]),
+            })
+        return effects
 
     def pending_items(self,limit:int=25)->List[Dict[str,Any]]:
         with self._conn() as conn:
@@ -476,8 +540,11 @@ class CognitiveScheduler:
                 break
             receipts.append(self.tick(max_items=max_items,max_ms=max_ms))
         pending=self.queue.pending_count()
-        return {"ticks":len(receipts),"quiescent":pending==0,
-                "pending":pending,"receipts":receipts}
+        unknown=self.queue.unknown_count()
+        return {"ticks":len(receipts),"quiescent":pending==0 and unknown==0,
+                "pending":pending,"unknown":unknown,
+                "unknown_effects":self.queue.unknown_effects(),
+                "blocked_on_reconciliation":unknown>0,"receipts":receipts}
 
     def tick(self,max_items:int=8,max_ms:int=300):
         self.current_tick+=1; self._save_tick()
