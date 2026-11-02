@@ -457,3 +457,57 @@ def test_unknown_effect_inventory_handles_non_object_json(tmp_path):
     assert effects[0]["capability"] is None
     assert "private-payload" not in str(effects)
     assert queue.unknown_count() == 1
+
+
+def test_unknown_capability_claim_cannot_be_requeued_or_cleared_by_mark(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="quarantined-effect", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "memory.commit_reflection",
+                               "payload": {"text": "potential side effect"}}},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    queue.mark("quarantined-effect", ItemStatus.PROCESSING)
+    queue.mark("quarantined-effect", ItemStatus.UNKNOWN)
+    queue.mark("quarantined-effect", ItemStatus.UNKNOWN)  # idempotent quarantine
+
+    for unsafe in (ItemStatus.PENDING, ItemStatus.PROCESSING,
+                   ItemStatus.COMPLETED, ItemStatus.FAILED,
+                   ItemStatus.DROPPED_TTL):
+        try:
+            queue.mark("quarantined-effect", unsafe)
+        except ValueError as exc:
+            assert "requires explicit reconciliation" in str(exc)
+        else:
+            raise AssertionError(f"quarantine was bypassed: {unsafe}")
+        assert queue.unknown_count() == 1
+        assert queue.pending_count() == 0
+
+    restarted = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert restarted.unknown_count() == 1
+    assert restarted.pop_budgeted(1, max_items=1) == []
+
+
+def test_generic_mark_preserves_ordinary_cognition_and_unambiguous_actions(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue.db")
+    assert queue.push(CognitiveItem(
+        id="ordinary-thought", kind=ItemKind.THOUGHT,
+        content={"step": "resume"}, priority=0.5, depth=1,
+        parent_id=None, created_tick=0,
+    ))
+    queue.mark("ordinary-thought", ItemStatus.UNKNOWN)
+    queue.mark("ordinary-thought", ItemStatus.PENDING)
+    assert queue.pending_count() == 1
+
+    assert queue.push(CognitiveItem(
+        id="safe-action", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": {"capability": "cognition.queue_human_review"}},
+        priority=0.8, depth=1, parent_id=None, created_tick=0,
+    ))
+    queue.mark("safe-action", ItemStatus.PROCESSING)
+    queue.mark("safe-action", ItemStatus.COMPLETED)
+    assert queue.unknown_count() == 0
+    with queue._conn() as conn:
+        rows = dict(conn.execute("SELECT id,status FROM cognitive_queue"))
+    assert rows["ordinary-thought"] == ItemStatus.PENDING.value
+    assert rows["safe-action"] == ItemStatus.COMPLETED.value
