@@ -1,6 +1,6 @@
 # VictorOS scheduler crash-retry hardening (isolated candidate)
 
-Status: PARTIAL RUNTIME MITIGATION (2026-10-26), DRAFT. An in-flight action quarantine is integrated on this branch; the transactional outbox and provider idempotency contract are NOT implemented. Do not merge until exact-head CI and independent review.
+Status: PARTIAL RUNTIME MITIGATION (2026-10-26), DRAFT — see the 2026-11-05 addendum at the end: the transactional outbox is now integrated in the scheduler path as a draft for Issue #19. Do not merge until exact-head CI and independent review.
 
 ## Confirmed failure window
 The current scheduler persists ACTION_CANDIDATE, calls physiology.execute(), then records capability_results. A process exit after the capability side effect but before result storage strands a PROCESSING item, which the default-branch startup logic resets to PENDING, risking duplicate side effects.
@@ -40,6 +40,31 @@ The current draft branch now changes only `vos_core/cognitive_scheduler.py` and 
 ### Explicitly NOT solved
 
 This does not provide transactional intent/outbox persistence, stable provider idempotency keys, safe multi-worker leases, external receipt reconciliation, or exactly-once side effects. It only prevents one known automatic replay path. The P0 issue remains OPEN. Production promotion and merges remain blocked pending full outbox design, deterministic crash-injection acceptance, and owner approval.
+
+## 2026-11-05: transactional outbox integrated (draft, Issue #19)
+
+`vos_core/cognitive_scheduler.py` now carries the outbox this doc required,
+in the scheduler path only (no Chronos changes):
+
+- Stable effect ID (`eff_` + hash of capability + source item) and canonical
+  payload digest, recorded atomically with the action candidate; the same
+  effect ID with a different payload is rejected, never re-dispatched.
+- Concurrency-safe claim (one worker wins; expired leases can be re-claimed),
+  the effect ID passed to the provider as the idempotency key.
+- Result + observation + outbox completion co-committed in one SQLite
+  transaction; a provider timeout is treated as ambiguous (UNKNOWN), not
+  terminal. Bounded transient-failure retries (3 attempts) then DLQ.
+- `CognitiveScheduler.reconcile_effect()` is the only path out of UNKNOWN:
+  provider-confirmed "executed" commits the outcome exactly once;
+  "not_executed" returns the claim to PENDING for one safe retry.
+- Crash-injection acceptance: `tests/test_issue19_outbox.py` (14 tests,
+  deterministic, no real process kill) plus the 22 pre-existing scheduler
+  tests, all green locally. Full suite: 127 passed, 2 pre-existing failures
+  (`test_vos_apps.py`, missing `streamlit` in the test env, unrelated).
+
+Honest limit, unchanged: without provider-supported idempotency or a
+provider receipt, exactly-once external execution cannot be promised.
+Production promotion still requires owner review of the draft PR.
 
 ### Rollback
 

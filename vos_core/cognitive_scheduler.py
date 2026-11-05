@@ -84,12 +84,271 @@ def _canonical_json(value: Any) -> str:
 def _hash_payload(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
+def stable_effect_id(capability: str, source_item_id: Optional[str]) -> str:
+    """Deterministic effect ID for one capability dispatch from one source.
+
+    The same source + capability always yields the same effect ID, so a
+    re-derived candidate after a crash maps to the same outbox record and
+    the same provider idempotency key. The payload digest is stored
+    separately: the same effect ID with a different payload is a conflict,
+    never a silent re-dispatch.
+    """
+    key = {"capability": str(capability), "source_item_id": str(source_item_id or "")}
+    return "eff_" + _hash_payload(key)[:32]
+
+def effect_id_for_candidate(candidate: Dict[str, Any]) -> str:
+    return stable_effect_id(candidate.get("capability"), candidate.get("source_item_id"))
+
+def _payload_digest(payload: Any) -> str:
+    return _hash_payload(payload or {})
+
+# Outbox statuses. READY = intent recorded, never dispatched. CLAIMED = one
+# worker holds a bounded lease. COMPLETED = outcome durably recorded.
+# UNKNOWN = ambiguous outcome, fail-closed quarantine, never auto-replayed.
+# FAILED = DLQ: transient-failure budget exhausted, terminal.
+OUTBOX_MAX_ATTEMPTS = 3
+_AMBIGUOUS_ERROR_TYPES = ("TimeoutError", "ConnectionError", "Timeout")
+
+class EffectOutbox:
+    """Durable transactional outbox for capability effects.
+
+    Lives in the same SQLite file as the cognitive queue so intent records,
+    claims and completions are atomic with the queue rows they guard. This
+    is the Issue #19 fix: a stable effect ID + payload digest is recorded
+    before any external dispatch, dispatch carries that ID as the provider
+    idempotency key, and completion is co-committed with the capability
+    result and observation. Without provider-supported idempotency or a
+    provider receipt, exactly-once external execution cannot be promised;
+    ambiguous outcomes stay UNKNOWN until explicit reconciliation.
+    """
+    def __init__(self, db_path: str | Path):
+        self.db_path = Path(db_path)
+        self._init_schema()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def _init_schema(self):
+        with self._conn() as conn:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS effect_outbox(
+                effect_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL,
+                source_item_id TEXT,
+                queue_item_id TEXT,
+                payload_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                worker_id TEXT,
+                lease_expires_at TEXT,
+                result_json TEXT,
+                observation_event_id TEXT UNIQUE,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_status
+              ON effect_outbox(status, created_at ASC);
+            """)
+
+    @staticmethod
+    def _row_dict(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["attempts"] = int(d["attempts"])
+        d["max_attempts"] = int(d["max_attempts"])
+        return d
+
+    @staticmethod
+    def _record_with_conn(conn, effect_id, capability, source_item_id,
+                          payload_digest, queue_item_id=None, max_attempts=OUTBOX_MAX_ATTEMPTS):
+        now = _utcnow()
+        conn.execute("""
+          INSERT OR IGNORE INTO effect_outbox
+          (effect_id, capability, source_item_id, queue_item_id, payload_digest,
+           idempotency_key, status, attempts, max_attempts, created_at, updated_at)
+          VALUES(?,?,?,?,?,?, 'READY', 0, ?, ?, ?)
+        """, (effect_id, str(capability), str(source_item_id) if source_item_id is not None else None,
+              queue_item_id, payload_digest, effect_id, int(max_attempts), now, now))
+        row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise RuntimeError(f"effect outbox intent not recorded: {effect_id}")
+        if row["payload_digest"] != payload_digest:
+            raise ValueError(
+                f"effect_id {effect_id} already recorded with a different payload digest; "
+                "refusing to dispatch")
+        if queue_item_id is not None and row["queue_item_id"] is None:
+            conn.execute("UPDATE effect_outbox SET queue_item_id=?, updated_at=? WHERE effect_id=?",
+                         (queue_item_id, now, effect_id))
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        return EffectOutbox._row_dict(row)
+
+    def record_intent(self, effect_id, capability, source_item_id, payload_digest,
+                      queue_item_id=None, max_attempts=OUTBOX_MAX_ATTEMPTS) -> Dict[str, Any]:
+        with self._conn() as conn:
+            return self._record_with_conn(conn, effect_id, capability, source_item_id,
+                                          payload_digest, queue_item_id, max_attempts)
+
+    def get(self, effect_id) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        return self._row_dict(row)
+
+    def claim(self, effect_id, worker_id, lease_seconds: int = 30) -> bool:
+        """Concurrency-safe claim: exactly one worker wins.
+
+        A READY record, or a CLAIMED record whose lease has expired, can be
+        claimed; anything else (including COMPLETED / UNKNOWN / FAILED) cannot.
+        """
+        import datetime as _dt
+        lease_until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(lease_seconds))).isoformat()
+        now = _utcnow()
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE effect_outbox
+              SET status='CLAIMED', worker_id=?, lease_expires_at=?, attempts=attempts+1, updated_at=?
+              WHERE effect_id=? AND (status='READY'
+                OR (status='CLAIMED' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+            """, (worker_id, lease_until, now, effect_id, now)).rowcount
+        return bool(changed)
+
+    def release_claim(self, effect_id) -> bool:
+        """Return a CLAIMED record to READY without recording an outcome.
+
+        Only for dispatches that provably never ran (e.g. governance REJECTED
+        before the executor was invoked). Never used after an ambiguous error.
+        """
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='READY', worker_id=NULL,
+                lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='CLAIMED'
+            """, (_utcnow(), effect_id)).rowcount
+        return bool(changed)
+
+    @staticmethod
+    def _complete_with_conn(conn, effect_id, result, observation_event_id):
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+            observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+          WHERE effect_id=? AND status IN ('CLAIMED','READY','UNKNOWN')
+        """, (_canonical_json(result), observation_event_id, _utcnow(), effect_id)).rowcount
+        return bool(changed)
+
+    def complete(self, effect_id, result, observation_event_id) -> bool:
+        with self._conn() as conn:
+            return self._complete_with_conn(conn, effect_id, result, observation_event_id)
+
+    def mark_unknown(self, effect_id, error: Optional[str] = None) -> bool:
+        """Quarantine an ambiguous effect. Never overwrites a recorded outcome."""
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
+                lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status IN ('READY','CLAIMED')
+            """, (str(error)[:500] if error else None, _utcnow(), effect_id)).rowcount
+        return bool(changed)
+
+    def record_transient_failure(self, effect_id, error: Optional[str] = None) -> Dict[str, Any]:
+        """Bounded-retry accounting for a failure known not to have executed.
+
+        Returns the record to READY while attempts remain, otherwise moves it
+        to FAILED (dead-letter queue): terminal, never auto-retried. Callers
+        must only use this when the provider confirms non-execution; ambiguous
+        failures go to UNKNOWN via mark_unknown(), never here.
+        """
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            # attempts were already counted by claim(); this only decides
+            # whether the budget is exhausted. A failure after the final
+            # allowed attempt dead-letters the record.
+            attempts = int(row["attempts"])
+            status = "FAILED" if attempts >= int(row["max_attempts"]) else "READY"
+            conn.execute("""
+              UPDATE effect_outbox SET status=?, error=?,
+                worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=?
+            """, (status, str(error)[:500] if error else None, _utcnow(), effect_id))
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        return self._row_dict(row)
+
+    def recover_claimed_to_unknown(self) -> int:
+        """Restart recovery: every in-flight claim is ambiguous after a crash."""
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='UNKNOWN', worker_id=NULL,
+                lease_expires_at=NULL, updated_at=?
+              WHERE status='CLAIMED'
+            """, (_utcnow(),)).rowcount
+        return int(changed)
+
+    def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
+                  observation_event_id=None) -> Dict[str, Any]:
+        """Explicit, audited reconciliation for an UNKNOWN effect.
+
+        outcome "executed": record the provider-confirmed outcome.
+        outcome "not_executed": return the record to READY for one safe retry.
+        outcome "unknown": leave it quarantined.
+        Anything else raises ValueError. A COMPLETED record is never
+        contradicted by a "not_executed" claim.
+        """
+        if outcome not in ("executed", "not_executed", "unknown"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            current = self._row_dict(row)
+            if outcome == "unknown":
+                return {**current, "changed": False}
+            if outcome == "not_executed":
+                if current["status"] == "COMPLETED":
+                    raise ValueError(
+                        f"effect {effect_id} already recorded COMPLETED; "
+                        "provider 'not_executed' contradicts the recorded outcome")
+                stored = result if result is not None else {
+                    "reconciled": True, "provider_receipt": provider_receipt,
+                    "outcome": "not_executed"}
+                conn.execute("""
+                  UPDATE effect_outbox SET status='READY', result_json=?, error=NULL,
+                    worker_id=NULL, lease_expires_at=NULL, updated_at=?
+                  WHERE effect_id=?
+                """, (_canonical_json(stored), _utcnow(), effect_id))
+                return {**self._row_dict(conn.execute(
+                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()),
+                    "changed": True}
+            # outcome == "executed"
+            if current["status"] == "COMPLETED":
+                return {**current, "changed": False}
+            stored = result if result is not None else {
+                "reconciled": True, "provider_receipt": provider_receipt,
+                "outcome": "executed"}
+            obs_id = observation_event_id or current.get("observation_event_id")
+            conn.execute("""
+              UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+                observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=?
+            """, (_canonical_json(stored), obs_id, _utcnow(), effect_id))
+            return {**self._row_dict(conn.execute(
+                "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()),
+                "changed": True}
+
+
 class PersistentCognitiveQueue:
     """SQLite-backed priority queue. Pending thoughts survive process death/reboot."""
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self.outbox = EffectOutbox(self.db_path)
         # Capability effects may already have happened when the process died.
         # Quarantine ambiguous action claims; never replay them automatically.
         # Non-capability cognition can still resume from its pending queue.
@@ -103,6 +362,10 @@ class PersistentCognitiveQueue:
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
             )
+        # Any outbox claim still held at startup is equally ambiguous: the
+        # process died (or was killed) mid-dispatch. Quarantine it; only an
+        # explicit provider reconciliation may move it out of UNKNOWN.
+        self.outbox.recover_claimed_to_unknown()
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path, timeout=30)
@@ -187,6 +450,41 @@ class PersistentCognitiveQueue:
     def push(self, item: CognitiveItem) -> bool:
         with self._conn() as conn:
             return self._insert_with_conn(conn,item)
+
+    def push_with_effect_intent(self, item: CognitiveItem, effect_id: str,
+                                capability: str, source_item_id, payload_digest: str) -> bool:
+        """Atomically persist an action candidate AND its outbox intent.
+
+        One transaction: either both the queue row and the intent record
+        exist, or neither does. A payload-digest conflict for the same
+        effect ID raises ValueError and rolls the whole transaction back.
+        """
+        with self._conn() as conn:
+            inserted = self._insert_with_conn(conn, item)
+            if not inserted:
+                return False
+            EffectOutbox._record_with_conn(conn, effect_id, capability, source_item_id,
+                                           payload_digest, queue_item_id=item.id)
+            return True
+
+    def reconcile_mark(self, item_id: str, status: ItemStatus):
+        """Explicit reconciliation transition for a quarantined action claim.
+
+        Only UNKNOWN ACTION_CANDIDATE -> COMPLETED (provider confirmed the
+        effect) or -> PENDING (provider confirmed non-execution, safe retry)
+        is allowed, and only through this method. The generic mark() API
+        still refuses to move anything out of UNKNOWN.
+        """
+        if status not in (ItemStatus.COMPLETED, ItemStatus.PENDING):
+            raise ValueError("reconciliation may only resolve UNKNOWN to COMPLETED or PENDING")
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE cognitive_queue SET status=?, updated_at=?
+              WHERE id=? AND kind=? AND status=?
+            """, (status.value, _utcnow(), item_id,
+                  ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value)).rowcount
+            if not changed:
+                raise ValueError("only a quarantined UNKNOWN action candidate can be reconciled")
 
     def pop_budgeted(self,current_tick:int,max_items:int=8,max_ms:int=300)->List[CognitiveItem]:
         start=time.perf_counter(); out=[]
@@ -316,8 +614,13 @@ class WindowsCapabilityRegistry:
           "cognition.queue_human_review":self._queue_human_review,
         }
     def contains(self,capability): return capability in self.handlers
-    def execute(self,capability,payload):
+    def execute(self,capability,payload,idempotency_key=None):
         if capability not in self.handlers: raise KeyError("unregistered capability: "+capability)
+        # The stable effect ID travels with the dispatch as the provider
+        # idempotency key. Handlers ignore the extra key; a provider that
+        # honours it can dedupe a retried dispatch by this key.
+        if idempotency_key is not None:
+            payload = {**dict(payload), "_idempotency_key": idempotency_key}
         return self.handlers[capability](payload)
     def _commit_reflection(self,payload):
         text=str(payload.get("text","")).strip()
@@ -337,6 +640,12 @@ class CognitiveScheduler:
     def __init__(self,stack:VictorCognitionStack,physiology:VictorPhysiologyRuntime,db_path:str|Path):
         self.stack=stack; self.physiology=physiology; self.db_path=Path(db_path)
         self.queue=PersistentCognitiveQueue(self.db_path)
+        self.outbox=self.queue.outbox
+        # Crash-injection hook (tests only): called with the effect ID after
+        # a successful dispatch and before the result is committed. Raising
+        # BaseException here simulates a process kill in that window.
+        self.crash_hook: Optional[Callable[[str], None]] = None
+        self.outbox_lease_seconds = 30
         self.registry=WindowsCapabilityRegistry(stack)
         self.bus=CognitiveEventBus(); self.bus.subscribe(self._ingest_event)
         self.current_tick=max(self._load_tick(),int(self.stack.tick))
@@ -449,23 +758,69 @@ class CognitiveScheduler:
         valid=[dict(c) for c in candidates if c.get("capability") and 0<=float(c.get("score",0))<=1]
         return sorted(valid,key=lambda c:(float(c.get("score",0)),str(c["capability"]),str(c.get("source_item_id",""))),reverse=True)
 
-    def _execute(self,ranked):
+    def _execute(self,ranked,queue_item_id=None):
         if not ranked: return {"executed":None,"status":"NO_ACTION"}
         c=ranked[0]; capability=str(c["capability"])
         if not self.registry.contains(capability):
             return {"executed":None,"status":"BLOCKED_UNREGISTERED_CAPABILITY","capability":capability}
+        payload=dict(c.get("payload",{}))
+        effect_id=effect_id_for_candidate(c)
+        digest=_payload_digest(payload)
+        # 1. Atomic intent record, before any dispatch. Same effect ID with
+        # a different payload raises ValueError: never silently re-dispatch.
+        intent=self.outbox.record_intent(
+            effect_id,capability,c.get("source_item_id"),digest,
+            queue_item_id=queue_item_id)
+        # 2. Dedupe: an already-completed effect returns its stored outcome
+        # without touching the provider again.
+        if intent["status"]=="COMPLETED" and intent.get("result_json"):
+            return json.loads(intent["result_json"])
+        if intent["status"]=="UNKNOWN":
+            raise RuntimeError(
+                f"ambiguous capability effect {effect_id} requires reconciliation")
+        if intent["status"]=="FAILED":
+            return {"executed":None,"status":"BLOCKED_DLQ","capability":capability,
+                    "effect_id":effect_id}
+        # 3. Concurrency-safe claim: exactly one worker may dispatch.
+        worker_id=f"scheduler-{id(self)}-tick{self.current_tick}"
+        if not self.outbox.claim(effect_id,worker_id,lease_seconds=self.outbox_lease_seconds):
+            return {"executed":None,"status":"BLOCKED_CLAIMED","capability":capability,
+                    "effect_id":effect_id}
         proposal=ActionProposal(
           name=capability,capability=capability,provenance="victor-cognitive-scheduler",
           required_authorities=("local_owner",),consequence=.08,irreversibility=.05,
           uncertainty=max(0.0,1.0-float(c.get("score",.5))),novelty=.10,arousal=0,
           urgency=0,capability_power=.10,
-          metadata={"scheduler_tick":self.current_tick,"source_item_id":c.get("source_item_id")})
-        d=self.physiology.execute(proposal,lambda:self.registry.execute(capability,dict(c.get("payload",{}))))
+          metadata={"scheduler_tick":self.current_tick,"source_item_id":c.get("source_item_id"),
+                    "effect_id":effect_id,"idempotency_key":effect_id})
+        # 4. Dispatch with the stable effect ID as the provider idempotency key.
+        d=self.physiology.execute(proposal,
+            lambda:self.registry.execute(capability,payload,idempotency_key=effect_id))
+        # Governance rejected before the executor ran: provably no effect,
+        # so release the claim and record the rejection exactly as before.
+        if d.status.value=="REJECTED":
+            self.outbox.release_claim(effect_id)
+        # A provider timeout / connection failure is ambiguous: the effect
+        # may or may not have happened. Quarantine it; never record a
+        # terminal outcome and never auto-retry.
+        elif d.status.value=="FAILED":
+            outcome=d.actual_outcome or {}
+            error_type=str(outcome.get("error_type",""))
+            if error_type in _AMBIGUOUS_ERROR_TYPES:
+                self.outbox.mark_unknown(
+                    effect_id,f"ambiguous provider failure: {error_type}: {outcome.get('error','')}")
+                raise RuntimeError(
+                    f"ambiguous provider failure for effect {effect_id} "
+                    f"({error_type}); requires reconciliation")
         observation_id=uuid.uuid4().hex
         result={"capability":capability,"decision_status":d.status.value,
           "governance_mode":d.governance_mode.value,"reasons":list(d.reasons),
           "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome,
-          "observation_event_id":observation_id}
+          "observation_event_id":observation_id,
+          "effect_id":effect_id,"idempotency_key":effect_id}
+        # Crash-injection point (tests only): after dispatch, before commit.
+        if self.crash_hook is not None:
+            self.crash_hook(effect_id)
         observation=CognitiveItem(
           id=observation_id,kind=ItemKind.OBSERVATION,
           content={"event_type":"action_observation","capability":capability,
@@ -475,6 +830,13 @@ class CognitiveScheduler:
           priority=max(0.05,min(1.0,float(c.get("score",0.5)))),
           depth=int(c.get("source_depth",0))+1,
           parent_id=c.get("source_item_id"),created_tick=self.current_tick)
+        # 5. One atomic transaction: capability result + observation +
+        # outbox completion. If any part fails, all of it rolls back and the
+        # outbox stays CLAIMED (restart recovery quarantines it UNKNOWN).
+        # A REJECTED dispatch provably never ran, so its outcome is recorded
+        # in capability_results exactly as before but the outbox is NOT
+        # completed: a later dispatch must re-evaluate governance.
+        record_outcome = d.status.value != "REJECTED"
         with self._conn() as conn:
             conn.execute("""INSERT INTO capability_results
               (tick,capability,status,payload_json,receipt_hash,observation_event_id,
@@ -485,7 +847,81 @@ class CognitiveScheduler:
                float(c.get("score",0.5)),_utcnow()))
             if not self.queue._insert_with_conn(conn,observation):
                 raise RuntimeError("durable observation id collision")
+            if record_outcome:
+                EffectOutbox._complete_with_conn(
+                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id)
         return {"executed":result,"status":d.status.value}
+
+    def reconcile_effect(self,effect_id, outcome, provider_receipt=None):
+        """Explicit provider reconciliation for an UNKNOWN effect.
+
+        outcome "executed": provider confirms the effect happened. The
+        recorded outcome is committed (result + observation, deduped on the
+        observation event ID) and the quarantined queue claim resolves to
+        COMPLETED. outcome "not_executed": provider confirms it did not
+        happen; the queue claim returns to PENDING for one safe retry.
+        outcome "unknown": nothing changes. This is the ONLY path out of
+        UNKNOWN; tick() and mark() never auto-retry a quarantined effect.
+        """
+        row=self.outbox.get(effect_id)
+        if row is None:
+            raise KeyError(f"unknown effect_id: {effect_id}")
+        if outcome=="unknown":
+            return {"effect_id":effect_id,"status":row["status"],"outcome":"unknown",
+                    "changed":False}
+        if outcome not in ("executed","not_executed"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
+        if outcome=="not_executed":
+            if row["status"]=="COMPLETED":
+                raise ValueError(
+                    f"effect {effect_id} already recorded COMPLETED; "
+                    "provider 'not_executed' contradicts the recorded outcome")
+            reconciled=self.outbox.reconcile(effect_id,"not_executed",
+                                            provider_receipt=provider_receipt)
+            if row.get("queue_item_id"):
+                try:
+                    self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.PENDING)
+                except ValueError:
+                    pass  # queue claim already resolved; outbox state governs
+            return {"effect_id":effect_id,"status":reconciled["status"],
+                    "outcome":"not_executed","changed":reconciled["changed"]}
+        # outcome == "executed"
+        if row["status"]=="COMPLETED" and row.get("result_json"):
+            return {"effect_id":effect_id,"status":"COMPLETED","outcome":"executed",
+                    "changed":False,"executed":json.loads(row["result_json"])}
+        observation_id=row.get("observation_event_id") or uuid.uuid4().hex
+        result={"capability":row["capability"],"decision_status":"EXECUTED",
+          "governance_mode":"GREEN","reasons":["provider_reconciliation"],
+          "receipt_hash":row.get("result_json") and json.loads(row["result_json"]).get("executed",{}).get("receipt_hash"),
+          "outcome":{"ok":True,"result":{"reconciled":True,"provider_receipt":provider_receipt}},
+          "observation_event_id":observation_id,
+          "effect_id":effect_id,"idempotency_key":effect_id}
+        stored={"executed":result,"status":"EXECUTED"}
+        with self._conn() as conn:
+            conn.execute("""INSERT OR IGNORE INTO capability_results
+              (tick,capability,status,payload_json,receipt_hash,observation_event_id,
+               source_item_id,source_depth,priority,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (self.current_tick,row["capability"],"EXECUTED",_canonical_json(result),
+               result["receipt_hash"],observation_id,row.get("source_item_id"),0,0.5,_utcnow()))
+            observation=CognitiveItem(
+              id=observation_id,kind=ItemKind.OBSERVATION,
+              content={"event_type":"action_observation","capability":row["capability"],
+                "status":"EXECUTED","governance_mode":"GREEN",
+                "reasons":["provider_reconciliation"],
+                "receipt_hash":result["receipt_hash"],
+                "outcome":result["outcome"],"reconciled":True},
+              priority=0.5,depth=1,parent_id=row.get("source_item_id"),
+              created_tick=self.current_tick)
+            self.queue._insert_with_conn(conn,observation)
+            EffectOutbox._complete_with_conn(conn,effect_id,stored,observation_id)
+        if row.get("queue_item_id"):
+            try:
+                self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.COMPLETED)
+            except ValueError:
+                pass
+        return {"effect_id":effect_id,"status":"COMPLETED","outcome":"executed",
+                "changed":True,"executed":stored}
 
     def _recover_missing_observations(self):
         """Project legacy committed results into exactly one durable observation."""
@@ -569,32 +1005,58 @@ class CognitiveScheduler:
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
         ranked=self._choice_rank(candidates)
         selected_action_id=None
-        for index,candidate in enumerate(ranked):
+        # Persist each candidate together with its outbox intent in one
+        # atomic transaction. A payload-digest conflict for a stable effect
+        # ID is fail-closed: the candidate is dropped, never dispatched.
+        durable_ranked=[]
+        for candidate in ranked:
+            effect_id=effect_id_for_candidate(candidate)
             durable_action=CognitiveItem(
               id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
               content={"candidate":candidate},priority=float(candidate.get("score",0.5)),
               depth=int(candidate.get("source_depth",0)),
               parent_id=candidate.get("source_item_id"),created_tick=self.current_tick)
-            if not self.queue.push(durable_action):
+            try:
+                pushed=self.queue.push_with_effect_intent(
+                    durable_action,effect_id,str(candidate["capability"]),
+                    candidate.get("source_item_id"),_payload_digest(candidate.get("payload",{})))
+            except ValueError as exc:
+                receipt.setdefault("errors",[]).append(f"effect intent conflict: {exc}")
+                continue
+            if not pushed:
                 raise RuntimeError("failed to persist action candidate")
+            durable_ranked.append((durable_action,candidate))
+        ranked=[candidate for _,candidate in durable_ranked]
+        for index,(durable_action,candidate) in enumerate(durable_ranked):
             if index==0:
                 selected_action_id=durable_action.id
                 self.queue.mark(selected_action_id,ItemStatus.PROCESSING)
             else:
                 receipt["deferred_actions"]+=1
-        # Every candidate is durable before capability invocation. A selected
-        # PROCESSING claim has an ambiguous outcome after a crash or exception:
-        # quarantine it as UNKNOWN until a human/provider reconciles the effect.
-        # This is a fail-closed mitigation, NOT an idempotent transactional outbox.
+        # Every candidate is durable, with its outbox intent, before any
+        # capability invocation. A selected PROCESSING claim has an ambiguous
+        # outcome after a crash or exception: quarantine it as UNKNOWN until
+        # a human/provider reconciles the effect. The outbox (stable effect
+        # ID, atomic intent, idempotency key, co-committed completion) is
+        # what makes a later safe retry possible; quarantine alone is not it.
         try:
-            receipt["execution"]=self._execute(ranked)
+            receipt["execution"]=self._execute(ranked,queue_item_id=selected_action_id)
         except BaseException:
             if selected_action_id is not None:
                 self.queue.mark(selected_action_id,ItemStatus.UNKNOWN)
             raise
         else:
             if selected_action_id is not None:
-                self.queue.mark(selected_action_id,ItemStatus.COMPLETED)
+                status=str(receipt["execution"].get("status",""))
+                if status=="BLOCKED_DLQ":
+                    self.queue.mark(selected_action_id,ItemStatus.FAILED)
+                elif status.startswith("BLOCKED_"):
+                    # Claimed by another worker, or already quarantined:
+                    # leave PROCESSING so restart recovery quarantines it
+                    # UNKNOWN rather than silently completing it.
+                    receipt["execution_blocked"]=status
+                else:
+                    self.queue.mark(selected_action_id,ItemStatus.COMPLETED)
         receipt["queue_size_end"]=self.queue.pending_count()
         receipt["receipt_hash"]=self._write_tick_receipt({k:v for k,v in receipt.items() if k!="receipt_hash"})
         return receipt
