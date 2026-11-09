@@ -254,22 +254,25 @@ def test_two_worker_claim_race_only_one_dispatches(tmp_path):
     blocked = s._execute([cand])
     assert blocked["status"] == "BLOCKED_CLAIMED"
     assert calls == []
-    # After the lease expires the claim can be taken by another worker;
-    # while worker-b holds it, a dispatch attempt is blocked, not duplicated.
+    # Lease expiry is not proof that worker A's provider call stopped.
+    # A second worker must not reclaim or dispatch an ambiguous effect.
     assert s.outbox.claim(effect_id, "worker-b", lease_seconds=0) is False
-    # (lease was issued for 30s; expiry is time-based, so force it in the test DB)
     with s._conn() as conn:
         conn.execute("UPDATE effect_outbox SET lease_expires_at='2000-01-01T00:00:00+00:00' "
                      "WHERE effect_id=?", (effect_id,))
-    assert s.outbox.claim(effect_id, "worker-b") is True
+    assert s.outbox.claim(effect_id, "worker-b") is False
     assert s._execute([cand])["status"] == "BLOCKED_CLAIMED"
     assert calls == []
-    with s._conn() as conn:
-        conn.execute("UPDATE effect_outbox SET lease_expires_at='2000-01-01T00:00:00+00:00' "
-                     "WHERE effect_id=?", (effect_id,))
-    assert s._execute([cand])["status"] == "EXECUTED"
-    assert len(calls) == 1
+    assert s.outbox.get(effect_id)["worker_id"] == "worker-a"
 
+    # Restart quarantines the abandoned claim; no worker may replay it
+    # without explicit reconciliation of the provider outcome.
+    _, _, recovered = restart(tmp_path)
+    assert recovered.outbox.get(effect_id)["status"] == "UNKNOWN"
+    assert recovered.outbox.claim(effect_id, "worker-b") is False
+    with pytest.raises(RuntimeError, match="requires reconciliation"):
+        recovered._execute([cand])
+    assert calls == []
 
 def test_provider_timeout_is_ambiguous_not_terminal(tmp_path):
     _, _, s = runtime(tmp_path)
