@@ -203,8 +203,9 @@ class EffectOutbox:
     def claim(self, effect_id, worker_id, lease_seconds: int = 30) -> bool:
         """Concurrency-safe claim: exactly one worker wins.
 
-        A READY record, or a CLAIMED record whose lease has expired, can be
-        claimed; anything else (including COMPLETED / UNKNOWN / FAILED) cannot.
+        Only a READY record may be claimed. An expired CLAIMED lease is
+        ambiguous: the original worker may still be executing an external
+        side effect. Never re-dispatch it without authoritative reconciliation.
         """
         import datetime as _dt
         lease_until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(lease_seconds))).isoformat()
@@ -213,9 +214,8 @@ class EffectOutbox:
             changed = conn.execute("""
               UPDATE effect_outbox
               SET status='CLAIMED', worker_id=?, lease_expires_at=?, attempts=attempts+1, updated_at=?
-              WHERE effect_id=? AND (status='READY'
-                OR (status='CLAIMED' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
-            """, (worker_id, lease_until, now, effect_id, now)).rowcount
+              WHERE effect_id=? AND status='READY'
+            """, (worker_id, lease_until, now, effect_id)).rowcount
         return bool(changed)
 
     def release_claim(self, effect_id) -> bool:
