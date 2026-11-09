@@ -49,7 +49,7 @@ in the scheduler path only (no Chronos changes):
 - Stable effect ID (`eff_` + hash of capability + source item) and canonical
   payload digest, recorded atomically with the action candidate; the same
   effect ID with a different payload is rejected, never re-dispatched.
-- Concurrency-safe claim (one worker wins; expired leases can be re-claimed),
+- Concurrency-safe claim (one READY worker wins; expired CLAIMED leases are **not** re-claimed automatically),
   the effect ID passed to the provider as the idempotency key.
 - Result + observation + outbox completion co-committed in one SQLite
   transaction; a provider timeout is treated as ambiguous (UNKNOWN), not
@@ -69,3 +69,18 @@ Production promotion still requires owner review of the draft PR.
 ### Rollback
 
 Revert the two 2026-10-26 code/test commits on this draft branch or close PR #18. No production data or schema migration is performed; the new status is a value in the existing SQLite `status` column.
+
+## 2026-11-08: expired-lease replay gate (draft)
+
+The outbox claim transition now permits **READY -> CLAIMED only**. A lease expiry
+alone cannot prove that the previous worker stopped a provider call; therefore
+an expired CLAIMED record cannot be reclaimed or dispatched by a second worker.
+Restart recovery moves unresolved CLAIMED records to UNKNOWN for explicit
+reconciliation. The existing two-worker regression now checks this fail-closed
+behavior after forcing lease expiry, including restart quarantine.
+
+This is a bounded replay-risk mitigation, **not** complete worker-generation
+fencing or provider-authenticated reconciliation. Live stale-worker completion,
+lease-expiry reconciliation without restart, and externally authenticated
+receipts remain outstanding. The draft must not merge or deploy without
+exact-head CI, independent review, and founder approval.
