@@ -272,11 +272,16 @@ class EffectOutbox:
             # allowed attempt dead-letters the record.
             attempts = int(row["attempts"])
             status = "FAILED" if attempts >= int(row["max_attempts"]) else "READY"
-            conn.execute("""
+            # A stale failure callback must never resurrect a terminal,
+            # completed, or quarantined effect. Require an active claim.
+            changed = conn.execute("""
               UPDATE effect_outbox SET status=?, error=?,
                 worker_id=NULL, lease_expires_at=NULL, updated_at=?
-              WHERE effect_id=?
-            """, (status, str(error)[:500] if error else None, _utcnow(), effect_id))
+              WHERE effect_id=? AND status='CLAIMED'
+            """, (status, str(error)[:500] if error else None, _utcnow(), effect_id)).rowcount
+            if changed != 1:
+                raise ValueError(
+                    f"effect {effect_id} is not CLAIMED; refusing transient-failure transition")
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
         return self._row_dict(row)
 
