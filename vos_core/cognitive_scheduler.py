@@ -309,34 +309,37 @@ class EffectOutbox:
             current = self._row_dict(row)
             if outcome == "unknown":
                 return {**current, "changed": False}
+            if current["status"] == "COMPLETED":
+                if outcome == "executed":
+                    return {**current, "changed": False}
+                raise ValueError(
+                    f"effect {effect_id} already recorded COMPLETED; "
+                    "provider 'not_executed' contradicts the recorded outcome")
+            if current["status"] != "UNKNOWN":
+                raise ValueError(
+                    f"effect {effect_id} in {current['status']} cannot be reconciled; "
+                    "only UNKNOWN effects may transition")
             if outcome == "not_executed":
-                if current["status"] == "COMPLETED":
-                    raise ValueError(
-                        f"effect {effect_id} already recorded COMPLETED; "
-                        "provider 'not_executed' contradicts the recorded outcome")
                 stored = result if result is not None else {
                     "reconciled": True, "provider_receipt": provider_receipt,
                     "outcome": "not_executed"}
-                conn.execute("""
+                changed = conn.execute("""
                   UPDATE effect_outbox SET status='READY', result_json=?, error=NULL,
                     worker_id=NULL, lease_expires_at=NULL, updated_at=?
-                  WHERE effect_id=?
-                """, (_canonical_json(stored), _utcnow(), effect_id))
-                return {**self._row_dict(conn.execute(
-                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()),
-                    "changed": True}
-            # outcome == "executed"
-            if current["status"] == "COMPLETED":
-                return {**current, "changed": False}
-            stored = result if result is not None else {
-                "reconciled": True, "provider_receipt": provider_receipt,
-                "outcome": "executed"}
-            obs_id = observation_event_id or current.get("observation_event_id")
-            conn.execute("""
-              UPDATE effect_outbox SET status='COMPLETED', result_json=?,
-                observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
-              WHERE effect_id=?
-            """, (_canonical_json(stored), obs_id, _utcnow(), effect_id))
+                  WHERE effect_id=? AND status='UNKNOWN'
+                """, (_canonical_json(stored), _utcnow(), effect_id)).rowcount
+            else:
+                stored = result if result is not None else {
+                    "reconciled": True, "provider_receipt": provider_receipt,
+                    "outcome": "executed"}
+                obs_id = observation_event_id or current.get("observation_event_id")
+                changed = conn.execute("""
+                  UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+                    observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+                  WHERE effect_id=? AND status='UNKNOWN'
+                """, (_canonical_json(stored), obs_id, _utcnow(), effect_id)).rowcount
+            if changed != 1:
+                raise RuntimeError(f"effect {effect_id} reconciliation state changed")
             return {**self._row_dict(conn.execute(
                 "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()),
                 "changed": True}
