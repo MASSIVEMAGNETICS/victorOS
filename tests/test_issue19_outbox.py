@@ -433,3 +433,26 @@ def test_unknown_reconciliation_transitions_once(tmp_path):
         scheduler.outbox.reconcile(
             effect_id, "not_executed", provider_receipt="duplicate")
     assert scheduler.outbox.get(effect_id)["status"] == "READY"
+
+
+@pytest.mark.parametrize("terminal_state", ["READY", "UNKNOWN", "FAILED", "COMPLETED"])
+def test_transient_failure_cannot_resurrect_non_claimed_effect(tmp_path, terminal_state):
+    """Late failure callbacks cannot clear quarantine or terminal outcomes."""
+    _, _, scheduler = runtime(tmp_path)
+    effect_id = stable_effect_id("memory.commit_reflection", terminal_state)
+    scheduler.outbox.record_intent(
+        effect_id, "memory.commit_reflection", terminal_state, "digest")
+    if terminal_state != "READY":
+        assert scheduler.outbox.claim(effect_id, "worker-a")
+        if terminal_state == "UNKNOWN":
+            assert scheduler.outbox.mark_unknown(effect_id, "ambiguous")
+        elif terminal_state == "FAILED":
+            with scheduler.outbox._conn() as conn:
+                conn.execute("UPDATE effect_outbox SET status='FAILED' WHERE effect_id=?",
+                             (effect_id,))
+        else:
+            assert scheduler.outbox.complete(effect_id, {"ok": True}, "obs-terminal")
+    before = scheduler.outbox.get(effect_id)
+    with pytest.raises(ValueError, match="not CLAIMED"):
+        scheduler.outbox.record_transient_failure(effect_id, "late failure")
+    assert scheduler.outbox.get(effect_id) == before
