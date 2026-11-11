@@ -394,3 +394,42 @@ def test_generic_mark_still_cannot_clear_quarantine(tmp_path):
     # Only the explicit reconciliation path may resolve it.
     queue.reconcile_mark("quarantined-effect", ItemStatus.PENDING)
     assert queue.pending_count() == 1
+
+
+@pytest.mark.parametrize("state", ["READY", "CLAIMED", "FAILED"])
+@pytest.mark.parametrize("outcome", ["executed", "not_executed"])
+def test_reconciliation_cannot_override_non_unknown_state(tmp_path, state, outcome):
+    """Only quarantined effects may be reconciled, even with a supplied receipt."""
+    _, _, scheduler = runtime(tmp_path)
+    effect_id = stable_effect_id("memory.commit_reflection", f"state-{state}")
+    scheduler.outbox.record_intent(
+        effect_id, "memory.commit_reflection", f"state-{state}", "digest")
+    if state in ("CLAIMED", "FAILED"):
+        assert scheduler.outbox.claim(effect_id, "worker-a")
+    if state == "FAILED":
+        with scheduler.outbox._conn() as conn:
+            conn.execute(
+                "UPDATE effect_outbox SET status='FAILED' WHERE effect_id=?",
+                (effect_id,))
+    before = scheduler.outbox.get(effect_id)
+    with pytest.raises(ValueError, match="only UNKNOWN effects may transition"):
+        scheduler.outbox.reconcile(
+            effect_id, outcome, provider_receipt="unverified-receipt")
+    assert scheduler.outbox.get(effect_id) == before
+
+
+def test_unknown_reconciliation_transitions_once(tmp_path):
+    _, _, scheduler = runtime(tmp_path)
+    effect_id = stable_effect_id("memory.commit_reflection", "once")
+    scheduler.outbox.record_intent(
+        effect_id, "memory.commit_reflection", "once", "digest")
+    assert scheduler.outbox.claim(effect_id, "worker-a")
+    assert scheduler.outbox.mark_unknown(effect_id, "timeout")
+    result = scheduler.outbox.reconcile(
+        effect_id, "not_executed", provider_receipt="provider-confirmed-none")
+    assert result["status"] == "READY"
+    assert result["changed"] is True
+    with pytest.raises(ValueError, match="only UNKNOWN effects may transition"):
+        scheduler.outbox.reconcile(
+            effect_id, "not_executed", provider_receipt="duplicate")
+    assert scheduler.outbox.get(effect_id)["status"] == "READY"
