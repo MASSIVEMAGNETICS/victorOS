@@ -84,3 +84,75 @@ fencing or provider-authenticated reconciliation. Live stale-worker completion,
 lease-expiry reconciliation without restart, and externally authenticated
 receipts remain outstanding. The draft must not merge or deploy without
 exact-head CI, independent review, and founder approval.
+
+## 2026-11-12: live-worker startup conflict — acceptance contract (draft, unimplemented)
+
+**Evidence:** PR #22 head `427c30fbec48801e58ba87af48d93d45fe9a6b19`,
+[Python Core Tests #43171755654](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43171755654)
+failed on Python 3.10; Python 3.11/3.12 jobs were cancelled. The two
+new live-second-instance tests fail against current startup recovery.
+No passing exact-head CI is claimed.
+
+### Root cause and forbidden shortcut
+
+`PersistentCognitiveQueue.__init__` resets all PROCESSING cognition
+(unknown action candidates, pending other items) and invokes
+`EffectOutbox.recover_claimed_to_unknown()` for **every** CLAIMED effect.
+A second *live* scheduler opening the same SQLite database can therefore
+invalidate work owned by the first. Earlier crash-injection tests assume
+that opening another scheduler proves the first died; it does not.
+**Do not** fix by disabling all recovery, relaxing either regression,
+trusting lease expiration as proof of death, or automatically replaying
+ambiguous provider calls.
+
+### Proposed bounded implementation contract (not yet code)
+
+1. Record a unique owner incarnation token at scheduler startup, plus a
+   durable claim generation and owner identity on each PROCESSING queue item
+   and CLAIMED outbox effect. Add schema columns via additive migration,
+   preserving existing records and indexes.
+2. Make claim acquisition, completion, release, transient failure, and
+   UNKNOWN transitions conditional on the exact owner **and generation**.
+   A stale callback must change zero rows and must not write a result,
+   observation, or provider receipt. Use one SQLite transaction for
+   completion and all its local consequences.
+3. Treat another scheduler's startup as **observation**, not a recovery
+   authority. An unexpired heartbeat is advisory, and an expired lease is
+   not proof of death. A confirmed-death or explicit operator recovery
+   operation may quarantine ambiguous effects to UNKNOWN, but never
+   re-dispatch them. If death cannot be proven, retain CLAIMED/PROCESSING
+   and surface a blocked-recovery diagnostic.
+4. Keep provider-authoritative reconciliation separate from worker
+   recovery. Caller-supplied outcome strings are not authenticated
+   provider evidence. Preserve the human STOP/approval and EUSS gates.
+5. Legacy rows with missing owner/generation must fail closed. Document
+   any operator recovery workflow before enabling migration or deployment.
+
+### Required deterministic acceptance matrix
+
+| Scenario | Required outcome |
+| --- | --- |
+| Worker A owns live CLAIMED effect; worker B initializes | A claim unchanged; B cannot dispatch |
+| Worker A owns live PROCESSING cognition; B initializes | A item unchanged; B cannot pop it |
+| A lease expires while A still runs | B cannot steal, quarantine, or replay |
+| A completes with current owner/generation | One atomic result, observation and completion |
+| A stale completion/release/failure arrives after generation changes | Zero mutation; explicit conflict |
+| A is confirmed dead before provider ACK | Quarantine ambiguous effect; no replay |
+| Provider execution outcome remains unknown | UNKNOWN persists until authoritative reconciliation |
+| Provider confirms non-execution with auditable evidence | Controlled retry permitted, subject to governance |
+| Old schema or unknown owner | Additive migration; fail closed until reconciled |
+
+### Verification and rollback gate
+
+Run `python -m pytest tests/test_issue19_outbox.py -q`,
+`python -m pytest tests/test_cognitive_scheduler.py -q`, and
+`python -m pytest tests/ -q`; require passing exact-head Python 3.10,
+3.11, and 3.12 CI. Record commands and actual results. The existing
+crash tests must be adjusted only to model **confirmed death explicitly**,
+not to lower their no-replay assertions. Keep PR #22 draft and unmerged
+until independent review and founder approval. Roll back a future code
+change by reverting its draft-branch commit; do not reverse an applied
+schema migration or alter production data without a separate approved plan.
+
+**This appendix is a design/acceptance artifact only. It does not repair
+the failing tests or establish production safety.**
