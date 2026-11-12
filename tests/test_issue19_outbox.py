@@ -456,3 +456,48 @@ def test_transient_failure_cannot_resurrect_non_claimed_effect(tmp_path, termina
     with pytest.raises(ValueError, match="not CLAIMED"):
         scheduler.outbox.record_transient_failure(effect_id, "late failure")
     assert scheduler.outbox.get(effect_id) == before
+
+
+def test_live_second_instance_does_not_quarantine_first_worker_claim(tmp_path):
+    """A new queue object is not evidence that an existing worker died.
+
+    Regression for multi-instance startup: the first worker retains its live
+    outbox claim until an explicit, ownership-aware recovery decision.
+    """
+    _, _, first = runtime(tmp_path)
+    effect_id = stable_effect_id("memory.commit_reflection", "live-instance")
+    first.outbox.record_intent(
+        effect_id, "memory.commit_reflection", "live-instance", "digest")
+    assert first.outbox.claim(effect_id, "worker-a", lease_seconds=300)
+    before = first.outbox.get(effect_id)
+    assert before["status"] == "CLAIMED"
+    assert before["worker_id"] == "worker-a"
+
+    # This is a concurrent instance, not a simulated process crash.
+    second = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    after = second.outbox.get(effect_id)
+    assert after["status"] == "CLAIMED"
+    assert after["worker_id"] == "worker-a"
+    assert second.outbox.claim(effect_id, "worker-b") is False
+
+
+def test_live_second_instance_does_not_reset_processing_cognition(tmp_path):
+    """Initialization must not hand live PROCESSING cognition to worker B."""
+    first = PersistentCognitiveQueue(tmp_path / "queue-live.db")
+    assert first.push(CognitiveItem(
+        id="live-thought", kind=ItemKind.THOUGHT,
+        content={"text": "in progress"}, priority=0.8,
+        depth=0, parent_id=None, created_tick=0))
+    claimed = first.pop_budgeted(current_tick=0, max_items=1)
+    assert len(claimed) == 1
+    assert claimed[0].id == "live-thought"
+    assert claimed[0].status == ItemStatus.PROCESSING
+
+    # A separate instance cannot infer worker death merely by starting.
+    second = PersistentCognitiveQueue(tmp_path / "queue-live.db")
+    assert second.pop_budgeted(current_tick=0, max_items=1) == []
+    with first._conn() as conn:
+        status = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?",
+            ("live-thought",)).fetchone()["status"]
+    assert status == ItemStatus.PROCESSING.value
