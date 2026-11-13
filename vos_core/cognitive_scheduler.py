@@ -233,12 +233,17 @@ class EffectOutbox:
         return bool(changed)
 
     @staticmethod
-    def _complete_with_conn(conn, effect_id, result, observation_event_id):
+    def _complete_with_conn(conn, effect_id, result, observation_event_id,
+                            expected_status="CLAIMED"):
+        """Complete only the expected state; UNKNOWN requires reconciliation."""
+        if expected_status not in ("CLAIMED", "UNKNOWN"):
+            raise ValueError("invalid outbox completion state")
         changed = conn.execute("""
           UPDATE effect_outbox SET status='COMPLETED', result_json=?,
             observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
-          WHERE effect_id=? AND status IN ('CLAIMED','READY','UNKNOWN')
-        """, (_canonical_json(result), observation_event_id, _utcnow(), effect_id)).rowcount
+          WHERE effect_id=? AND status=?
+        """, (_canonical_json(result), observation_event_id, _utcnow(),
+              effect_id, expected_status)).rowcount
         return bool(changed)
 
     def complete(self, effect_id, result, observation_event_id) -> bool:
@@ -868,8 +873,9 @@ class CognitiveScheduler:
             if not self.queue._insert_with_conn(conn,observation):
                 raise RuntimeError("durable observation id collision")
             if record_outcome:
-                EffectOutbox._complete_with_conn(
-                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id)
+                if not EffectOutbox._complete_with_conn(
+                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id):
+                    raise RuntimeError("outbox claim changed before completion; rolling back result")
         return {"executed":result,"status":d.status.value}
 
     def reconcile_effect(self,effect_id, outcome, provider_receipt=None):
@@ -934,7 +940,9 @@ class CognitiveScheduler:
               priority=0.5,depth=1,parent_id=row.get("source_item_id"),
               created_tick=self.current_tick)
             self.queue._insert_with_conn(conn,observation)
-            EffectOutbox._complete_with_conn(conn,effect_id,stored,observation_id)
+            if not EffectOutbox._complete_with_conn(
+                conn,effect_id,stored,observation_id,expected_status="UNKNOWN"):
+                raise RuntimeError("outbox quarantine changed before reconciliation commit")
         if row.get("queue_item_id"):
             try:
                 self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.COMPLETED)
