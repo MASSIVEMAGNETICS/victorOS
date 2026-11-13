@@ -357,23 +357,35 @@ class PersistentCognitiveQueue:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self.outbox = EffectOutbox(self.db_path)
-        # Capability effects may already have happened when the process died.
-        # Quarantine ambiguous action claims; never replay them automatically.
-        # Non-capability cognition can still resume from its pending queue.
+        # Construction is not evidence that another worker terminated.
+        # Never mutate another instance's in-flight cognition or outbox claim
+        # merely because this queue object was opened.
+
+    def recover_after_confirmed_shutdown(self, *, confirmed_terminated: bool = False) -> Dict[str, int]:
+        """Operator-gated recovery ONLY after exclusive worker termination is proven.
+
+        Caller must establish that ALL previous workers using this database
+        have terminated and no concurrent scheduler can resume. Lease expiry,
+        opening a new instance, and process-local exceptions are not proof.
+        Do not call during ordinary startup. External effects are quarantined,
+        never redispatched, pending authoritative provider reconciliation.
+        """
+        if confirmed_terminated is not True:
+            raise PermissionError("recovery requires confirmed termination of all previous workers")
         with self._conn() as conn:
-            conn.execute(
+            action_count = conn.execute(
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=? AND kind=?",
                 (ItemStatus.UNKNOWN.value, _utcnow(), ItemStatus.PROCESSING.value,
                  ItemKind.ACTION_CANDIDATE.value),
-            )
-            conn.execute(
+            ).rowcount
+            cognition_count = conn.execute(
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
-            )
-        # Any outbox claim still held at startup is equally ambiguous: the
-        # process died (or was killed) mid-dispatch. Quarantine it; only an
-        # explicit provider reconciliation may move it out of UNKNOWN.
-        self.outbox.recover_claimed_to_unknown()
+            ).rowcount
+        effect_count = self.outbox.recover_claimed_to_unknown()
+        return {"quarantined_actions": int(action_count),
+                "requeued_cognition": int(cognition_count),
+                "quarantined_effects": effect_count}
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path, timeout=30)
