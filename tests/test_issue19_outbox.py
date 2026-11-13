@@ -46,7 +46,11 @@ def restart(tmp_path, name="physiology2.jsonl"):
         receipt_ledger=PhysiologyReceiptLedger(str(tmp_path / name)),
         granted_authorities=("local_owner",),
     )
-    return stack, phys, CognitiveScheduler(stack, phys, tmp_path / "victor_stack.db")
+    scheduler = CognitiveScheduler(stack, phys, tmp_path / "victor_stack.db")
+    # Test harness explicitly simulates a terminated prior process. Merely
+    # opening a second instance must never trigger this recovery in production.
+    scheduler.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
+    return stack, phys, scheduler
 
 
 def candidate(text="outbox memory", source="source-1"):
@@ -501,3 +505,33 @@ def test_live_second_instance_does_not_reset_processing_cognition(tmp_path):
             "SELECT status FROM cognitive_queue WHERE id=?",
             ("live-thought",)).fetchone()["status"]
     assert status == ItemStatus.PROCESSING.value
+
+
+def test_recovery_requires_explicit_termination_authority(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "recovery-guard.db")
+    with pytest.raises(PermissionError, match="confirmed termination"):
+        queue.recover_after_confirmed_shutdown()
+    with pytest.raises(PermissionError, match="confirmed termination"):
+        queue.recover_after_confirmed_shutdown(confirmed_terminated=False)
+
+
+def test_explicit_recovery_quarantines_claims_and_requeues_cognition(tmp_path):
+    path = tmp_path / "recovery-guard.db"
+    first = PersistentCognitiveQueue(path)
+    assert first.push(CognitiveItem(
+        id="recover-thought", kind=ItemKind.THOUGHT,
+        content={"text": "recover"}, priority=0.7, depth=0,
+        parent_id=None, created_tick=0))
+    assert len(first.pop_budgeted(current_tick=0, max_items=1)) == 1
+    effect_id = stable_effect_id("memory.commit_reflection", "recover")
+    first.outbox.record_intent(effect_id, "memory.commit_reflection", "recover", "digest")
+    assert first.outbox.claim(effect_id, "terminated-worker")
+    second = PersistentCognitiveQueue(path)
+    assert second.outbox.get(effect_id)["status"] == "CLAIMED"
+    assert second.pending_count() == 0
+    receipt = second.recover_after_confirmed_shutdown(confirmed_terminated=True)
+    assert receipt == {"quarantined_actions": 0, "requeued_cognition": 1,
+                       "quarantined_effects": 1}
+    assert second.outbox.get(effect_id)["status"] == "UNKNOWN"
+    assert second.pending_count() == 1
+    assert second.outbox.claim(effect_id, "replacement-worker") is False
