@@ -577,3 +577,50 @@ def test_expired_claim_recovery_quarantines_before_any_retry(tmp_path):
     assert recovery["quarantined_effects"] == 1
     assert replacement.outbox.get(effect_id)["status"] == "UNKNOWN"
     assert replacement.outbox.claim(effect_id, "worker-replacement") is False
+
+
+def test_direct_completion_requires_active_claim_and_preserves_quarantine(tmp_path):
+    """Neither an unclaimed intent nor UNKNOWN can be completed by a callback."""
+    outbox = EffectOutbox(tmp_path / "completion-guard.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "completion-guard")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "completion-guard", "digest"
+    )
+    before = outbox.get(effect_id)
+    assert outbox.complete(effect_id, {"ok": True}, "obs-unclaimed") is False
+    assert outbox.get(effect_id) == before
+
+    assert outbox.claim(effect_id, "worker-original")
+    assert outbox.mark_unknown(effect_id, "provider timeout")
+    quarantined = outbox.get(effect_id)
+    assert outbox.complete(effect_id, {"ok": True}, "obs-stale") is False
+    assert outbox.get(effect_id) == quarantined
+
+    # Only explicit reconciliation may move UNKNOWN to COMPLETED.
+    reconciled = outbox.reconcile(
+        effect_id, "executed", provider_receipt="operator-supplied-receipt"
+    )
+    assert reconciled["status"] == "COMPLETED"
+    assert outbox.complete(effect_id, {"ok": True}, "obs-duplicate") is False
+
+
+def test_dispatch_completion_state_change_rolls_back_result_and_observation(tmp_path):
+    """A callback cannot report success if its claim was quarantined mid-flight."""
+    _, _, scheduler = runtime(tmp_path)
+    cand = candidate(source="completion-race")
+    effect_id = effect_id_for_candidate(cand)
+
+    def quarantine_before_commit(dispatched_effect_id):
+        assert dispatched_effect_id == effect_id
+        assert scheduler.outbox.mark_unknown(effect_id, "simulated concurrent recovery")
+
+    scheduler.crash_hook = quarantine_before_commit
+    with pytest.raises(RuntimeError, match="claim changed before completion"):
+        scheduler._execute([cand])
+    assert scheduler.outbox.get(effect_id)["status"] == "UNKNOWN"
+    with scheduler._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM capability_results").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE kind=?",
+            (ItemKind.OBSERVATION.value,),
+        ).fetchone()[0] == 0
