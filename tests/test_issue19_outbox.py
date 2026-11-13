@@ -535,3 +535,45 @@ def test_explicit_recovery_quarantines_claims_and_requeues_cognition(tmp_path):
     assert second.outbox.get(effect_id)["status"] == "UNKNOWN"
     assert second.pending_count() == 1
     assert second.outbox.claim(effect_id, "replacement-worker") is False
+
+
+def test_expired_lease_does_not_authorize_another_worker_claim(tmp_path):
+    """A timeout is not proof that the first provider dispatch stopped."""
+    outbox = EffectOutbox(tmp_path / "lease-safety.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "expired-lease")
+    outbox.record_intent(effect_id, "memory.commit_reflection", "expired-lease", "digest")
+    assert outbox.claim(effect_id, "worker-original", lease_seconds=1)
+    with outbox._conn() as conn:
+        conn.execute(
+            "UPDATE effect_outbox SET lease_expires_at=? WHERE effect_id=?",
+            ("2000-01-01T00:00:00+00:00", effect_id),
+        )
+    before = outbox.get(effect_id)
+    assert before["status"] == "CLAIMED"
+    assert outbox.claim(effect_id, "worker-replacement") is False
+    assert outbox.get(effect_id) == before
+
+
+def test_expired_claim_recovery_quarantines_before_any_retry(tmp_path):
+    """Even an expired claim must pass explicit shutdown and reconciliation."""
+    path = tmp_path / "expired-recovery.db"
+    original = PersistentCognitiveQueue(path)
+    effect_id = stable_effect_id("memory.commit_reflection", "expired-recovery")
+    original.outbox.record_intent(
+        effect_id, "memory.commit_reflection", "expired-recovery", "digest"
+    )
+    assert original.outbox.claim(effect_id, "worker-original", lease_seconds=1)
+    with original.outbox._conn() as conn:
+        conn.execute(
+            "UPDATE effect_outbox SET lease_expires_at=? WHERE effect_id=?",
+            ("2000-01-01T00:00:00+00:00", effect_id),
+        )
+    replacement = PersistentCognitiveQueue(path)
+    assert replacement.outbox.get(effect_id)["status"] == "CLAIMED"
+    assert replacement.outbox.claim(effect_id, "worker-replacement") is False
+    recovery = replacement.recover_after_confirmed_shutdown(
+        confirmed_terminated=True
+    )
+    assert recovery["quarantined_effects"] == 1
+    assert replacement.outbox.get(effect_id)["status"] == "UNKNOWN"
+    assert replacement.outbox.claim(effect_id, "worker-replacement") is False
