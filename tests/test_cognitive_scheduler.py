@@ -255,6 +255,8 @@ def test_restart_quarantines_inflight_action_but_recovers_non_action(tmp_path):
     queue.mark("safe-thought",ItemStatus.PROCESSING)
 
     recovered=PersistentCognitiveQueue(db)
+    # Simulated crash: the test harness has confirmed the prior worker ended.
+    recovered.recover_after_confirmed_shutdown(confirmed_terminated=True)
     assert [row["id"] for row in recovered.pending_items()]==["safe-thought"]
     with recovered._conn() as conn:
         statuses=dict(conn.execute("SELECT id,status FROM cognitive_queue"))
@@ -312,6 +314,8 @@ def test_unknown_capability_effect_blocks_quiescence_after_restart(tmp_path):
     ))
     scheduler.queue.mark("unreconciled-effect", ItemStatus.PROCESSING)
     recovered = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
+    # Simulate confirmed termination before recovering the ambiguous effect.
+    recovered.recover_after_confirmed_shutdown(confirmed_terminated=True)
     assert recovered.pending_count() == 0
     assert recovered.unknown_count() == 1
 
