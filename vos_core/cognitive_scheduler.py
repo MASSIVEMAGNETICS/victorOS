@@ -451,12 +451,12 @@ class PersistentCognitiveQueue:
         # leave the local projections in different states.
         with self._conn() as conn:
             action_count = conn.execute(
-                "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=? AND kind=?",
+                "UPDATE cognitive_queue SET status=?, worker_id=NULL, updated_at=? WHERE status=? AND kind=?",
                 (ItemStatus.UNKNOWN.value, _utcnow(), ItemStatus.PROCESSING.value,
                  ItemKind.ACTION_CANDIDATE.value),
             ).rowcount
             cognition_count = conn.execute(
-                "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
+                "UPDATE cognitive_queue SET status=?, worker_id=NULL, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
             ).rowcount
             effect_count = EffectOutbox._recover_claimed_to_unknown_with_conn(conn)
