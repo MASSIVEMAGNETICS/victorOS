@@ -226,3 +226,15 @@ These are GitHub-hosted CI results. No local pytest run is claimed. The workflow
 **Scope limit:** This change fences `effect_outbox` claim callbacks only. `cognitive_queue` PROCESSING rows do not yet carry owner/generation tokens; the separate live queue-item ownership-fencing acceptance cases remain unimplemented. Do not describe the full scheduler multi-worker ownership contract as complete.
 
 **Approval:** Draft only. Require independent review of all token-bearing callback paths, production migration planning, provider-authenticated reconciliation, and explicit founder approval before merge or deployment.
+
+
+## November 14, 2026 — cognitive queue claim-generation fencing candidate
+
+- Additive `cognitive_queue.worker_id` and `claim_generation` columns preserve existing rows; legacy rows begin at generation zero.
+- `claim_item()` and `pop_budgeted()` atomically assign a worker incarnation and increment the generation. Returned `CognitiveItem` values carry the exact token.
+- Ordinary PROCESSING transitions require the original worker ID and generation through `mark_claimed()`. The compatibility `mark()` method refuses to mutate live PROCESSING claims and cannot quarantine an unclaimed action candidate.
+- The scheduler uses one UUID worker incarnation for cognitive-queue and outbox claims. The selected action queue row is completed in the same SQLite transaction as its capability result, observation, and outbox completion. Governance rejection releases the outbox and completes the queue item in that same transaction.
+- Added regressions for stale callbacks after recovery/reclaim (including same-worker generation reuse), legacy schema migration without row loss, token-required transitions, co-committed queue/outbox completion, and repair of a quarantined queue projection when its outbox result is already COMPLETED.
+- Recovery remains operator-gated. The `confirmed_terminated=True` argument is still an external assertion, not independent proof of process termination. Fencing prevents stale state transitions; it does not prove that a live process stopped performing non-transactional reasoning work.
+- Provider-receipt authenticity and distributed exactly-once external execution remain unresolved. Exact-head CI evidence is recorded in the PR review gate after the final commit.
+

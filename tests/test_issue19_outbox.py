@@ -54,6 +54,22 @@ def restart(tmp_path, name="physiology2.jsonl"):
     return stack, phys, scheduler
 
 
+def queue_claim_args(queue, item_id, worker_id=None):
+    """Acquire a durable cognitive-queue claim token for a regression fixture."""
+    claimed = queue.claim_item(item_id, worker_id=worker_id)
+    assert claimed is not None
+    return {
+        "worker_id": claimed.worker_id,
+        "claim_generation": claimed.claim_generation,
+    }
+
+
+def quarantine_queue_item(queue, item_id, worker_id=None):
+    token = queue_claim_args(queue, item_id, worker_id=worker_id)
+    assert queue.mark_claimed(item_id, ItemStatus.UNKNOWN, **token)
+    return token
+
+
 def candidate(text="outbox memory", source="source-1"):
     return {
         "capability": "memory.commit_reflection",
@@ -398,7 +414,7 @@ def test_generic_mark_still_cannot_clear_quarantine(tmp_path):
         content={"candidate": {"capability": "memory.commit_reflection"}},
         priority=0.8, depth=1, parent_id="source", created_tick=0,
     ))
-    queue.mark("quarantined-effect", ItemStatus.UNKNOWN)
+    quarantine_queue_item(queue, "quarantined-effect")
     for unsafe in (ItemStatus.PENDING, ItemStatus.COMPLETED):
         with pytest.raises(ValueError, match="requires explicit reconciliation"):
             queue.mark("quarantined-effect", unsafe)
@@ -728,3 +744,140 @@ def test_legacy_outbox_schema_adds_claim_generation_without_losing_rows(tmp_path
     with outbox._conn() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(effect_outbox)")}
     assert "claim_generation" in columns
+
+
+@pytest.mark.parametrize("replacement_worker", ["worker-a", "worker-b"])
+def test_cognitive_queue_claim_generation_fences_stale_callback_after_recovery(
+    tmp_path, replacement_worker
+):
+    path = tmp_path / "queue-generation.db"
+    first = PersistentCognitiveQueue(path)
+    assert first.push(CognitiveItem(
+        id="queue-generation-item", kind=ItemKind.THOUGHT,
+        content={"text": "generation fence"}, priority=0.8,
+        depth=0, parent_id=None, created_tick=0,
+    ))
+    old = first.claim_item("queue-generation-item", worker_id="worker-a")
+    assert old is not None
+    assert old.claim_generation == 1
+
+    second = PersistentCognitiveQueue(path)
+    recovery = second.recover_after_confirmed_shutdown(confirmed_terminated=True)
+    assert recovery["requeued_cognition"] == 1
+    current = second.claim_item("queue-generation-item", worker_id=replacement_worker)
+    assert current is not None
+    assert current.claim_generation == old.claim_generation + 1
+
+    old_token = {"worker_id": old.worker_id, "claim_generation": old.claim_generation}
+    current_token = {
+        "worker_id": current.worker_id,
+        "claim_generation": current.claim_generation,
+    }
+    assert first.mark_claimed(
+        "queue-generation-item", ItemStatus.COMPLETED, **old_token
+    ) is False
+    with second._conn() as conn:
+        row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            ("queue-generation-item",),
+        ).fetchone()
+    assert row["status"] == ItemStatus.PROCESSING.value
+    assert row["worker_id"] == replacement_worker
+    assert row["claim_generation"] == current.claim_generation
+    assert second.mark_claimed(
+        "queue-generation-item", ItemStatus.COMPLETED, **current_token
+    ) is True
+
+
+def test_cognitive_queue_legacy_schema_adds_fencing_columns_without_losing_rows(tmp_path):
+    path = tmp_path / "legacy-queue.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE cognitive_queue(
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                priority REAL NOT NULL,
+                depth INTEGER NOT NULL,
+                parent_id TEXT,
+                created_tick INTEGER NOT NULL,
+                ttl INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO cognitive_queue(
+                id,kind,content_json,priority,depth,parent_id,created_tick,ttl,
+                status,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, ("legacy-thought", "THOUGHT", '{"text":"preserve"}', 0.7, 0,
+              None, 0, 50, "PENDING", "2026-11-14T00:00:00+00:00",
+              "2026-11-14T00:00:00+00:00"))
+
+    queue = PersistentCognitiveQueue(path)
+    with queue._conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cognitive_queue)")}
+        row = conn.execute(
+            "SELECT * FROM cognitive_queue WHERE id='legacy-thought'"
+        ).fetchone()
+    assert {"worker_id", "claim_generation"} <= columns
+    assert row["content_json"] == '{"text":"preserve"}'
+    assert row["worker_id"] is None
+    assert row["claim_generation"] == 0
+    claimed = queue.claim_item("legacy-thought", worker_id="legacy-worker")
+    assert claimed is not None
+    assert claimed.claim_generation == 1
+
+
+def test_generic_mark_cannot_mutate_processing_without_claim_token(tmp_path):
+    queue = PersistentCognitiveQueue(tmp_path / "queue-mark-fence.db")
+    assert queue.push(CognitiveItem(
+        id="live-claim", kind=ItemKind.THOUGHT, content={"text": "live"},
+        priority=0.5, depth=0, parent_id=None, created_tick=0,
+    ))
+    claim = queue.claim_item("live-claim", worker_id="owner-a")
+    assert claim is not None
+    with pytest.raises(PermissionError, match="worker_id and claim_generation"):
+        queue.mark("live-claim", ItemStatus.COMPLETED)
+    assert queue.mark_claimed(
+        "live-claim", ItemStatus.COMPLETED,
+        worker_id="owner-b", claim_generation=claim.claim_generation
+    ) is False
+    assert queue.mark_claimed(
+        "live-claim", ItemStatus.COMPLETED,
+        worker_id=claim.worker_id, claim_generation=claim.claim_generation
+    ) is True
+
+
+def test_completed_outbox_reconciliation_repairs_unknown_queue_projection(tmp_path):
+    _, _, scheduler = runtime(tmp_path)
+    effect_id = stable_effect_id("memory.commit_reflection", "completed-queue-repair")
+    assert scheduler.queue.push(CognitiveItem(
+        id="completed-queue-repair", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source="completed-queue-repair")},
+        priority=0.8, depth=1, parent_id="source", created_tick=0,
+    ))
+    scheduler.outbox.record_intent(
+        effect_id, "memory.commit_reflection", "completed-queue-repair",
+        "digest", queue_item_id="completed-queue-repair"
+    )
+    token = claim_args(scheduler.outbox, effect_id, "worker-a")
+    assert scheduler.outbox.complete(
+        effect_id, {"executed": {"ok": True}, "status": "EXECUTED"},
+        "observation-completed-repair", **token
+    )
+    with scheduler._conn() as conn:
+        conn.execute(
+            "UPDATE cognitive_queue SET status=? WHERE id=?",
+            (ItemStatus.UNKNOWN.value, "completed-queue-repair")
+        )
+    result = scheduler.reconcile_effect(effect_id, "executed")
+    assert result["changed"] is False
+    with scheduler._conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?",
+            ("completed-queue-repair",)
+        ).fetchone()
+    assert row["status"] == ItemStatus.COMPLETED.value

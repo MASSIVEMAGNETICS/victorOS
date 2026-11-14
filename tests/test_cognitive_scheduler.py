@@ -10,6 +10,19 @@ from vos_core.cognitive_scheduler import (
 from vos_core.physiology import PhysiologyReceiptLedger, VictorPhysiologyRuntime
 from vos_core.victor_cognition_stack import VictorCognitionStack
 
+def queue_claim_args(queue, item_id, worker_id=None):
+    claimed=queue.claim_item(item_id, worker_id=worker_id)
+    assert claimed is not None
+    return {"worker_id":claimed.worker_id,
+            "claim_generation":claimed.claim_generation}
+
+
+def quarantine_queue_item(queue, item_id, worker_id=None):
+    token=queue_claim_args(queue,item_id,worker_id=worker_id)
+    assert queue.mark_claimed(item_id,ItemStatus.UNKNOWN,**token)
+    return token
+
+
 def runtime(tmp_path):
     stack=VictorCognitionStack(str(tmp_path/"victor_stack.db"))
     phys=VictorPhysiologyRuntime(
@@ -51,6 +64,15 @@ def test_human_stop_blocks_capability_execution(tmp_path):
     r=s.tick(max_items=1)
     assert r["execution"]["status"]=="REJECTED"
     assert "human_stop_active" in r["execution"]["executed"]["reasons"]
+    with s._conn() as conn:
+        rejected = conn.execute("""
+            SELECT q.status AS queue_status, o.status AS outbox_status
+            FROM cognitive_queue q
+            JOIN effect_outbox o ON o.queue_item_id=q.id
+            WHERE q.kind=? ORDER BY q.created_at DESC LIMIT 1
+        """, (ItemKind.ACTION_CANDIDATE.value,)).fetchone()
+    assert rejected["queue_status"] == ItemStatus.COMPLETED.value
+    assert rejected["outbox_status"] == "READY"
 
 def test_context_retrieval_uses_real_memory(tmp_path):
     stack,phys,s=runtime(tmp_path)
@@ -75,6 +97,15 @@ def test_execution_observation_reenters_queue_and_closes_loop(tmp_path):
     assert first["generated_thoughts"]==1
     second=s.tick(max_items=1)
     assert second["execution"]["status"]=="EXECUTED"
+    with s._conn() as conn:
+        completed_action = conn.execute("""
+            SELECT q.status AS queue_status, o.status AS outbox_status
+            FROM cognitive_queue q
+            JOIN effect_outbox o ON o.queue_item_id=q.id
+            WHERE q.kind=? ORDER BY q.created_at DESC LIMIT 1
+        """, (ItemKind.ACTION_CANDIDATE.value,)).fetchone()
+    assert completed_action["queue_status"] == ItemStatus.COMPLETED.value
+    assert completed_action["outbox_status"] == "COMPLETED"
     executed=second["execution"]["executed"]
     assert executed["receipt_hash"]
     assert executed["observation_event_id"]
@@ -251,8 +282,8 @@ def test_restart_quarantines_inflight_action_but_recovers_non_action(tmp_path):
         content={"step":"review"},priority=0.5,depth=1,
         parent_id="source",created_tick=1,
     ))
-    queue.mark("ambiguous-action",ItemStatus.PROCESSING)
-    queue.mark("safe-thought",ItemStatus.PROCESSING)
+    claimed = queue.pop_budgeted(current_tick=1,max_items=2,worker_id="crash-worker")
+    assert {item.id for item in claimed} == {"ambiguous-action","safe-thought"}
 
     recovered=PersistentCognitiveQueue(db)
     # Simulated crash: the test harness has confirmed the prior worker ended.
@@ -312,7 +343,9 @@ def test_unknown_capability_effect_blocks_quiescence_after_restart(tmp_path):
                                "payload": {"text": "possibly executed"}, "score": 0.8}},
         priority=0.8, depth=1, parent_id="source", created_tick=0,
     ))
-    scheduler.queue.mark("unreconciled-effect", ItemStatus.PROCESSING)
+    assert scheduler.queue.claim_item(
+        "unreconciled-effect", worker_id=scheduler.worker_id
+    ) is not None
     recovered = PersistentCognitiveQueue(tmp_path / "victor_stack.db")
     # Simulate confirmed termination before recovering the ambiguous effect.
     recovered.recover_after_confirmed_shutdown(confirmed_terminated=True)
@@ -359,7 +392,7 @@ def test_unknown_effect_inventory_is_redacted_bounded_and_stable(tmp_path):
                                    "payload": {"text": f"private-secret-{index}"}}},
             priority=0.8, depth=1, parent_id="source", created_tick=index,
         ))
-        queue.mark(f"ambiguous-{index}", ItemStatus.UNKNOWN)
+        quarantine_queue_item(queue, f"ambiguous-{index}")
     assert queue.unknown_count() == 2
     first = queue.unknown_effects(limit=1)
     assert len(first) == 1
@@ -404,7 +437,7 @@ def test_quiescence_report_includes_redacted_reconciliation_inventory(tmp_path):
                                "payload": {"text": "do-not-expose"}}},
         priority=0.8, depth=1, parent_id="source", created_tick=0,
     ))
-    scheduler.queue.mark("needs-review", ItemStatus.UNKNOWN)
+    quarantine_queue_item(scheduler.queue, "needs-review")
     report = scheduler.run_until_quiescent(max_ticks=2)
     assert report["quiescent"] is False
     assert report["unknown"] == 1
@@ -423,7 +456,7 @@ def test_corrupt_unknown_effect_remains_visible_without_payload_leak(tmp_path):
                                "payload": {"text": "private"}}},
         priority=0.8, depth=1, parent_id="source", created_tick=0,
     ))
-    scheduler.queue.mark("corrupt-effect", ItemStatus.UNKNOWN)
+    quarantine_queue_item(scheduler.queue, "corrupt-effect")
     # Model on-disk corruption after a crash, not a normal API write.
     with scheduler._conn() as conn:
         conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
@@ -451,7 +484,7 @@ def test_unknown_effect_inventory_handles_non_object_json(tmp_path):
         content={"candidate": {"capability": "memory.commit_reflection"}},
         priority=0.8, depth=1, parent_id="source", created_tick=1,
     ))
-    queue.mark("non-object-effect", ItemStatus.UNKNOWN)
+    quarantine_queue_item(queue, "non-object-effect")
     with queue._conn() as conn:
         conn.execute("UPDATE cognitive_queue SET content_json=? WHERE id=?",
                      ('["private-payload"]', "non-object-effect"))
@@ -471,8 +504,7 @@ def test_unknown_capability_claim_cannot_be_requeued_or_cleared_by_mark(tmp_path
                                "payload": {"text": "potential side effect"}}},
         priority=0.8, depth=1, parent_id="source", created_tick=0,
     ))
-    queue.mark("quarantined-effect", ItemStatus.PROCESSING)
-    queue.mark("quarantined-effect", ItemStatus.UNKNOWN)
+    quarantine_queue_item(queue, "quarantined-effect")
     queue.mark("quarantined-effect", ItemStatus.UNKNOWN)  # idempotent quarantine
 
     for unsafe in (ItemStatus.PENDING, ItemStatus.PROCESSING,
@@ -508,8 +540,8 @@ def test_generic_mark_preserves_ordinary_cognition_and_unambiguous_actions(tmp_p
         content={"candidate": {"capability": "cognition.queue_human_review"}},
         priority=0.8, depth=1, parent_id=None, created_tick=0,
     ))
-    queue.mark("safe-action", ItemStatus.PROCESSING)
-    queue.mark("safe-action", ItemStatus.COMPLETED)
+    safe_token = queue_claim_args(queue, "safe-action")
+    assert queue.mark_claimed("safe-action", ItemStatus.COMPLETED, **safe_token)
     assert queue.unknown_count() == 0
     with queue._conn() as conn:
         rows = dict(conn.execute("SELECT id,status FROM cognitive_queue"))
