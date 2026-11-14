@@ -228,7 +228,7 @@ These are GitHub-hosted CI results. No local pytest run is claimed. The workflow
 **Approval:** Draft only. Require independent review of all token-bearing callback paths, production migration planning, provider-authenticated reconciliation, and explicit founder approval before merge or deployment.
 
 
-## November 14, 2026 — cognitive queue claim-generation fencing candidate
+## November 14, 2026 — cognitive queue claim-generation fencing implemented (draft PR)
 
 - Additive `cognitive_queue.worker_id` and `claim_generation` columns preserve existing rows; legacy rows begin at generation zero.
 - `claim_item()` and `pop_budgeted()` atomically assign a worker incarnation and increment the generation. Returned `CognitiveItem` values carry the exact token.
@@ -236,5 +236,6 @@ These are GitHub-hosted CI results. No local pytest run is claimed. The workflow
 - The scheduler uses one UUID worker incarnation for cognitive-queue and outbox claims. The selected action queue row is completed in the same SQLite transaction as its capability result, observation, and outbox completion. Governance rejection releases the outbox and completes the queue item in that same transaction.
 - Added regressions for stale callbacks after recovery/reclaim (including same-worker generation reuse), legacy schema migration without row loss, token-required transitions, co-committed queue/outbox completion, and repair of a quarantined queue projection when its outbox result is already COMPLETED.
 - Recovery remains operator-gated. The `confirmed_terminated=True` argument is still an external assertion, not independent proof of process termination. Fencing prevents stale state transitions; it does not prove that a live process stopped performing non-transactional reasoning work.
-- Provider-receipt authenticity and distributed exactly-once external execution remain unresolved. Exact-head CI evidence is recorded in the PR review gate after the final commit.
+- Verification: GitHub Actions run #43630799647 passed 156 tests on each of Python 3.10, 3.11, and 3.12 for code/test commit `339cc910c94ed744e0cc70ce98c34952d501ffb1`. Python 3.12 reported 108 deprecation warnings; the workflow also reports Node.js 20 action deprecation notices. No test failures occurred.
+- Provider-receipt authenticity and distributed exactly-once external execution remain unresolved.
 
