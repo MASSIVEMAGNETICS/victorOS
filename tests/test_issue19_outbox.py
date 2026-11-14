@@ -881,3 +881,41 @@ def test_completed_outbox_reconciliation_repairs_unknown_queue_projection(tmp_pa
             ("completed-queue-repair",)
         ).fetchone()
     assert row["status"] == ItemStatus.COMPLETED.value
+
+
+def test_action_candidate_stale_callback_cannot_mutate_reconciled_new_claim(tmp_path):
+    path = tmp_path / "action-queue-generation.db"
+    first = PersistentCognitiveQueue(path)
+    assert first.push(CognitiveItem(
+        id="action-generation-item", kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source="action-generation-item")},
+        priority=0.9, depth=1, parent_id="source", created_tick=0,
+    ))
+    old = first.claim_item("action-generation-item", worker_id="worker-a")
+    assert old is not None
+    assert old.claim_generation == 1
+
+    second = PersistentCognitiveQueue(path)
+    recovery = second.recover_after_confirmed_shutdown(confirmed_terminated=True)
+    assert recovery["unknown_actions"] == 1
+    second.reconcile_mark("action-generation-item", ItemStatus.PENDING)
+    current = second.claim_item("action-generation-item", worker_id="worker-b")
+    assert current is not None
+    assert current.claim_generation == old.claim_generation + 1
+
+    assert first.mark_claimed(
+        "action-generation-item", ItemStatus.COMPLETED,
+        worker_id=old.worker_id, claim_generation=old.claim_generation
+    ) is False
+    with second._conn() as conn:
+        row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            ("action-generation-item",),
+        ).fetchone()
+    assert row["status"] == ItemStatus.PROCESSING.value
+    assert row["worker_id"] == "worker-b"
+    assert row["claim_generation"] == current.claim_generation
+    assert second.mark_claimed(
+        "action-generation-item", ItemStatus.COMPLETED,
+        worker_id=current.worker_id, claim_generation=current.claim_generation
+    ) is True
