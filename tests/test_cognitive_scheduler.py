@@ -580,7 +580,7 @@ def test_stale_parent_claim_cannot_commit_followups_or_candidates(tmp_path):
             }],
         }
 
-    with mock.patch.object(s,"_reason",side_effect=lose_claim_during_reason):
+    with mock.patch.object(s,"_reason",side_effect=lose_claim_during_reasoning):
         receipt=s.tick(max_items=1)
 
     assert receipt["generated_thoughts"]==0
