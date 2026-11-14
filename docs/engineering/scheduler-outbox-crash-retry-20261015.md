@@ -197,3 +197,30 @@ full-suite checks and exact-head Python 3.10–3.12 CI before any merge.
 claim exactly-once external effects without independent review and explicit
 founder approval. Documentation rollback: revert this addendum commit on the
 draft branch; no production migration is involved.
+
+
+## 2026-11-14: durable claim-generation fencing implementation candidate
+
+**Objective:** Prevent a delayed callback from an earlier outbox claim from mutating a later claim of the same effect, including when the same scheduler incarnation reacquires the effect.
+
+**Implementation on this draft branch:**
+- Added `claim_generation INTEGER NOT NULL DEFAULT 0` to new outbox tables and an additive `ALTER TABLE` migration for existing SQLite databases. Existing rows retain their data and start at generation zero.
+- Added `EffectOutbox.claim_with_token()`; every successful READY-to-CLAIMED transition increments and returns the claim generation with the worker ID. The existing boolean `claim()` wrapper remains for callers that only need claim success.
+- Ordinary release, UNKNOWN quarantine, transient-failure, and completion transitions now require the originating worker ID and claim generation in their conditional SQL predicates. Missing tokens fail closed; stale tokens change zero rows.
+- Scheduler instances now use a UUID worker-incarnation identifier, and `_execute()` propagates the claim token through rejection release, ambiguous-failure quarantine, and the result/observation/outbox completion transaction.
+- Regression coverage now exercises same-worker release/reacquire, stale release/quarantine/completion/failure callbacks, and additive migration from a legacy outbox schema.
+
+**Files:** `vos_core/cognitive_scheduler.py`, `tests/test_issue19_outbox.py`.
+
+**Verification:** Exact code-and-test head `070c6f68d3e46a911f1994e3db44805cc79d6b13` passed [Python Core Tests workflow #43624240980](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43624240980). The workflow ran `python -m pytest tests/ -q` on Python 3.10, 3.11, and 3.12:
+- Python 3.10: **151 passed**
+- Python 3.11: **151 passed**
+- Python 3.12: **151 passed, 108 warnings**
+
+These are GitHub-hosted CI results. No local pytest run is claimed. The workflow uses `actions/checkout@v4` and `actions/setup-python@v5`; GitHub logged a Node.js 20 deprecation warning for those actions. This maintenance change did not alter the workflow.
+
+**Residual risks and limits:** The migration is additive and regression-tested, but production database rollout has not occurred. The caller-supplied provider receipt/outcome remains unauthenticated by this change. `recover_after_confirmed_shutdown(confirmed_terminated=True)` still represents an external operator assertion, not independent proof of process termination; its queue and outbox recovery steps are not one atomic transaction. This does not establish distributed exactly-once external execution. Keep UNKNOWN reconciliation and human approval gates separate.
+
+**Rollback:** Revert the code, test, and documentation commits on this draft branch. Do not reverse a production migration or alter production data as part of this draft rollback.
+
+**Approval:** Draft only. Require independent review of all token-bearing callback paths, production migration planning, provider-authenticated reconciliation, and explicit founder approval before merge or deployment.
