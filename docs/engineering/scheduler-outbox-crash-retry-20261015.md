@@ -248,9 +248,10 @@ transaction rolls back both tables together.
 
 The new regression test
 `test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox`
-injects a failure after the queue updates and verifies that both the queue
-claim and outbox claim remain unchanged; it then verifies a successful
-recovery moves the action candidate and effect to UNKNOWN together.
+injects a failure after the queue updates and verifies that the action,
+thought, and outbox claims all remain unchanged; it then verifies a successful
+recovery moves the action and effect to UNKNOWN, requeues the thought, and
+clears stale worker ownership from all recovered queue/outbox rows.
 
 The operator gate is unchanged: `confirmed_terminated=True` is still a
 caller assertion, not independent proof that all workers have terminated.
