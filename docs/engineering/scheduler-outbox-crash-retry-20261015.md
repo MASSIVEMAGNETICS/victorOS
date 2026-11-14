@@ -156,3 +156,44 @@ schema migration or alter production data without a separate approved plan.
 
 **This appendix is a design/acceptance artifact only. It does not repair
 the failing tests or establish production safety.**
+
+## 2026-11-14: implementation-status reconciliation and remaining gate
+
+**Evidence scope:** Inspected the exact draft branch source and PR #22 metadata on
+2026-11-14. This corrects the historical 2026-11-12 heading above: the
+startup-recovery mitigation is **implemented**, but the full ownership-fencing
+acceptance contract is **not**. Historical failed-CI evidence remains historical.
+
+- `PersistentCognitiveQueue.__init__` now only initializes the schema and
+  outbox; it does **not** implicitly reset another live scheduler's
+  PROCESSING/CLAIMED rows. This is a partial fix, not worker fencing.
+- `recover_after_confirmed_shutdown(confirmed_terminated=True)` is an
+  explicit operator-gated path. Its Boolean argument is a caller assertion,
+  **not proof** that all old workers are dead. Its queue updates and the
+  subsequent outbox-wide quarantine are separate transactions; do not
+  advertise this as a single atomic recovery operation.
+- `EffectOutbox.claim` still transitions only READY to CLAIMED atomically.
+  `release_claim`, `mark_unknown`, `record_transient_failure`, and ordinary
+  `_complete_with_conn` do not require a matching worker incarnation and
+  claim generation. `_execute` derives worker_id from process-local
+  `id(self)` and tick, which is not a durable fencing token.
+- PR #22 head inspected: `b27ebba497fb710dab107b57f5c3cbc078fb2b3d`.
+  Existing Python Core Tests workflow #43542729852 is recorded successful
+  for that head; this addendum did **not** execute new tests or prove
+  distributed worker safety.
+
+**Next bounded code objective (not implemented by this documentation commit):**
+add an incrementing durable claim generation and owner-incarnation field with
+additive SQLite migration; return the claim token on acquisition; pass it
+through all dispatch callback paths; enforce owner+generation in conditional
+UPDATE predicates; require completion result/observation and outbox transition
+to share one transaction; fail closed on missing legacy tokens. Add tests for
+stale completion, release, transient failure, quarantine, live second worker,
+expired lease, and legacy rows. Keep operator recovery and authenticated
+provider reconciliation as separate review gates. Require targeted pytest,
+full-suite checks and exact-head Python 3.10–3.12 CI before any merge.
+
+**Approval:** draft only. Do not merge, deploy, change production schema, or
+claim exactly-once external effects without independent review and explicit
+founder approval. Documentation rollback: revert this addendum commit on the
+draft branch; no production migration is involved.
