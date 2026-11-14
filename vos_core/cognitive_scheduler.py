@@ -680,6 +680,26 @@ class PersistentCognitiveQueue:
                 conn,item_id,status,worker_id,claim_generation
             )
 
+    def complete_claim_with_followups(self,item_id:str,followups:List[CognitiveItem],*,
+                                      worker_id,claim_generation)->Optional[int]:
+        """Complete one exact claim and insert its follow-up thoughts atomically.
+
+        Returns the number of inserted follow-ups, or None when the claim token
+        is stale. A stale worker cannot publish child thoughts or candidate
+        actions after losing ownership. Any insert error rolls back both the
+        child rows and the parent completion.
+        """
+        with self._conn() as conn:
+            if not self._transition_claim_with_conn(
+                conn,item_id,ItemStatus.COMPLETED,worker_id,claim_generation
+            ):
+                return None
+            inserted=0
+            for item in followups:
+                if self._insert_with_conn(conn,item):
+                    inserted+=1
+            return inserted
+
     def mark(self,item_id:str,status:ItemStatus):
         """Compatibility state API that cannot mutate a live or ambiguous claim.
 
@@ -1226,19 +1246,23 @@ class CognitiveScheduler:
                 continue
             try:
                 reasoned=self._reason(item,self._retrieve_context(item))
+                followups=[]
                 for f in reasoned["followup_thoughts"]:
-                    child=CognitiveItem(id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
+                    followups.append(CognitiveItem(
+                      id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
                       priority=max(0,min(1,float(f.get("priority",.5)))),depth=item.depth+1,
-                      parent_id=item.id,created_tick=self.current_tick)
-                    if self.queue.push(child): receipt["generated_thoughts"]+=1
-                candidates.extend(reasoned["candidate_actions"])
-                receipt["generated_actions"]+=len(reasoned["candidate_actions"])
-                if not self.queue.mark_claimed(
-                    item.id,ItemStatus.COMPLETED,**claim_token
-                ):
+                      parent_id=item.id,created_tick=self.current_tick))
+                inserted=self.queue.complete_claim_with_followups(
+                    item.id,followups,**claim_token
+                )
+                if inserted is None:
                     receipt.setdefault("errors",[]).append(
                         f"stale queue completion: {item.id}"
                     )
+                    continue
+                receipt["generated_thoughts"]+=inserted
+                candidates.extend(reasoned["candidate_actions"])
+                receipt["generated_actions"]+=len(reasoned["candidate_actions"])
             except Exception as exc:
                 if not self.queue.mark_claimed(
                     item.id,ItemStatus.FAILED,**claim_token

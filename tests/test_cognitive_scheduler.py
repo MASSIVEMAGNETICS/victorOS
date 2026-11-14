@@ -549,3 +549,102 @@ def test_generic_mark_preserves_ordinary_cognition_and_unambiguous_actions(tmp_p
         rows = dict(conn.execute("SELECT id,status FROM cognitive_queue"))
     assert rows["ordinary-thought"] == ItemStatus.PENDING.value
     assert rows["safe-action"] == ItemStatus.COMPLETED.value
+
+
+def test_stale_parent_claim_cannot_commit_followups_or_candidates(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    parent=CognitiveItem(
+        id="stale-parent",kind=ItemKind.QUERY,content={"text":"stale parent"},
+        priority=0.9,depth=0,parent_id=None,created_tick=0,
+    )
+    assert s.queue.push(parent)
+
+    def lose_claim_during_reasoning(item,context):
+        old_generation=item.claim_generation
+        s.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
+        replacement=s.queue.claim_item(item.id,worker_id=s.worker_id)
+        assert replacement is not None
+        assert replacement.claim_generation==old_generation+1
+        return {
+            "followup_thoughts":[{
+                "kind":ItemKind.THOUGHT,
+                "content":{"step":"must-not-persist","origin_item_id":item.id},
+                "priority":0.5,
+            }],
+            "candidate_actions":[{
+                "capability":"test.unregistered",
+                "payload":{"must_not_dispatch":True},
+                "score":0.9,
+                "source_item_id":item.id,
+                "source_depth":item.depth,
+            }],
+        }
+
+    with mock.patch.object(s,"_reason",side_effect=lose_claim_during_reason):
+        receipt=s.tick(max_items=1)
+
+    assert receipt["generated_thoughts"]==0
+    assert receipt["generated_actions"]==0
+    assert receipt["execution"] is None
+    assert any("stale queue completion: stale-parent" in error
+               for error in receipt.get("errors",[]))
+    with s._conn() as conn:
+        row=conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            ("stale-parent",),
+        ).fetchone()
+        assert row["status"]==ItemStatus.PROCESSING.value
+        assert row["worker_id"]==s.worker_id
+        assert row["claim_generation"]==2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE id<>?",
+            ("stale-parent",),
+        ).fetchone()[0]==0
+        assert conn.execute("SELECT COUNT(*) FROM effect_outbox").fetchone()[0]==0
+
+
+def test_followup_insert_failure_rolls_back_parent_completion_and_children(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    parent=CognitiveItem(
+        id="atomic-parent",kind=ItemKind.THOUGHT,content={"step":"atomic"},
+        priority=0.8,depth=0,parent_id=None,created_tick=0,
+    )
+    assert s.queue.push(parent)
+    token=queue_claim_args(s.queue,"atomic-parent",worker_id=s.worker_id)
+    children=[
+        CognitiveItem(
+            id=f"atomic-child-{index}",kind=ItemKind.THOUGHT,
+            content={"step":f"child-{index}"},priority=0.5,depth=1,
+            parent_id="atomic-parent",created_tick=1,
+        )
+        for index in range(2)
+    ]
+    original_insert=s.queue._insert_with_conn
+    calls=0
+
+    def fail_second_insert(conn,item):
+        nonlocal calls
+        calls+=1
+        if calls==2:
+            raise RuntimeError("simulated second follow-up insert failure")
+        return original_insert(conn,item)
+
+    try:
+        with mock.patch.object(s.queue,"_insert_with_conn",side_effect=fail_second_insert):
+            s.queue.complete_claim_with_followups(
+                "atomic-parent",children,**token
+            )
+    except RuntimeError as exc:
+        assert "simulated second follow-up insert failure" in str(exc)
+    else:
+        raise AssertionError("follow-up failure must abort the whole transaction")
+
+    with s._conn() as conn:
+        parent_row=conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?",
+            ("atomic-parent",),
+        ).fetchone()
+        assert parent_row["status"]==ItemStatus.PROCESSING.value
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE id LIKE 'atomic-child-%'"
+        ).fetchone()[0]==0
