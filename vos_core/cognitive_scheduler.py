@@ -256,7 +256,7 @@ class EffectOutbox:
             changed = conn.execute("""
               UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
                 lease_expires_at=NULL, updated_at=?
-              WHERE effect_id=? AND status IN ('READY','CLAIMED')
+              WHERE effect_id=? AND status='CLAIMED'
             """, (str(error)[:500] if error else None, _utcnow(), effect_id)).rowcount
         return bool(changed)
 
