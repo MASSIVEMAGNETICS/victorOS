@@ -145,6 +145,7 @@ class EffectOutbox:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 max_attempts INTEGER NOT NULL DEFAULT 3,
                 worker_id TEXT,
+                claim_generation INTEGER NOT NULL DEFAULT 0,
                 lease_expires_at TEXT,
                 result_json TEXT,
                 observation_event_id TEXT UNIQUE,
@@ -156,6 +157,12 @@ class EffectOutbox:
               ON effect_outbox(status, created_at ASC);
             """)
 
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(effect_outbox)")}
+            if "claim_generation" not in columns:
+                conn.execute(
+                    "ALTER TABLE effect_outbox ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0"
+                )
+
     @staticmethod
     def _row_dict(row) -> Optional[Dict[str, Any]]:
         if row is None:
@@ -163,6 +170,7 @@ class EffectOutbox:
         d = dict(row)
         d["attempts"] = int(d["attempts"])
         d["max_attempts"] = int(d["max_attempts"])
+        d["claim_generation"] = int(d.get("claim_generation") or 0)
         return d
 
     @staticmethod
@@ -200,93 +208,134 @@ class EffectOutbox:
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
         return self._row_dict(row)
 
-    def claim(self, effect_id, worker_id, lease_seconds: int = 30) -> bool:
-        """Concurrency-safe claim: exactly one worker wins.
+    @staticmethod
+    def _require_claim_token(worker_id, claim_generation):
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id is required for claim transition")
+        if type(claim_generation) is not int or claim_generation < 1:
+            raise ValueError("claim_generation must be a positive integer")
+        return worker_id, claim_generation
 
-        Only a READY record may be claimed. An expired CLAIMED lease is
-        ambiguous: the original worker may still be executing an external
-        side effect. Never re-dispatch it without authoritative reconciliation.
+    def claim_with_token(self, effect_id, worker_id, lease_seconds: int = 30) -> Optional[Dict[str, Any]]:
+        """Atomically claim READY and return the durable owner/generation token.
+
+        A generation advances on every successful claim, including a retry by
+        the same worker incarnation. The token must accompany every callback
+        that mutates this claim; a stale token changes zero rows.
         """
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id is required")
         import datetime as _dt
         lease_until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(lease_seconds))).isoformat()
         now = _utcnow()
         with self._conn() as conn:
             changed = conn.execute("""
               UPDATE effect_outbox
-              SET status='CLAIMED', worker_id=?, lease_expires_at=?, attempts=attempts+1, updated_at=?
+              SET status='CLAIMED', worker_id=?, lease_expires_at=?,
+                  attempts=attempts+1, claim_generation=claim_generation+1,
+                  updated_at=?
               WHERE effect_id=? AND status='READY'
             """, (worker_id, lease_until, now, effect_id)).rowcount
-        return bool(changed)
+            if changed != 1:
+                return None
+            row = conn.execute(
+                "SELECT claim_generation FROM effect_outbox WHERE effect_id=? AND status='CLAIMED' AND worker_id=?",
+                (effect_id, worker_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("claimed effect disappeared before token read")
+            return {
+                "worker_id": worker_id,
+                "claim_generation": int(row["claim_generation"]),
+            }
 
-    def release_claim(self, effect_id) -> bool:
-        """Return a CLAIMED record to READY without recording an outcome.
+    def claim(self, effect_id, worker_id, lease_seconds: int = 30) -> bool:
+        """Compatibility predicate for callers that only need claim success.
 
-        Only for dispatches that provably never ran (e.g. governance REJECTED
-        before the executor was invoked). Never used after an ambiguous error.
+        Mutation callbacks must use claim_with_token() and retain its token.
         """
+        return self.claim_with_token(effect_id, worker_id, lease_seconds) is not None
+
+    def release_claim(self, effect_id, *, worker_id=None, claim_generation=None) -> bool:
+        """Release only the exact active claim that provably never dispatched."""
+        worker_id, claim_generation = self._require_claim_token(worker_id, claim_generation)
         with self._conn() as conn:
             changed = conn.execute("""
               UPDATE effect_outbox SET status='READY', worker_id=NULL,
                 lease_expires_at=NULL, updated_at=?
               WHERE effect_id=? AND status='CLAIMED'
-            """, (_utcnow(), effect_id)).rowcount
+                AND worker_id=? AND claim_generation=?
+            """, (_utcnow(), effect_id, worker_id, claim_generation)).rowcount
         return bool(changed)
 
     @staticmethod
     def _complete_with_conn(conn, effect_id, result, observation_event_id,
-                            expected_status="CLAIMED"):
-        """Complete only the expected state; UNKNOWN requires reconciliation."""
+                            expected_status="CLAIMED", *, worker_id=None,
+                            claim_generation=None):
+        """Complete UNKNOWN only through reconciliation; fence ordinary claims."""
         if expected_status not in ("CLAIMED", "UNKNOWN"):
             raise ValueError("invalid outbox completion state")
-        changed = conn.execute("""
+        where = "WHERE effect_id=? AND status=?"
+        params = (_canonical_json(result), observation_event_id, _utcnow(),
+                  effect_id, expected_status)
+        if expected_status == "CLAIMED":
+            worker_id, claim_generation = EffectOutbox._require_claim_token(
+                worker_id, claim_generation)
+            where += " AND worker_id=? AND claim_generation=?"
+            params += (worker_id, claim_generation)
+        changed = conn.execute(f"""
           UPDATE effect_outbox SET status='COMPLETED', result_json=?,
             observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
-          WHERE effect_id=? AND status=?
-        """, (_canonical_json(result), observation_event_id, _utcnow(),
-              effect_id, expected_status)).rowcount
+          {where}
+        """, params).rowcount
         return bool(changed)
 
-    def complete(self, effect_id, result, observation_event_id) -> bool:
+    def complete(self, effect_id, result, observation_event_id, *,
+                 worker_id=None, claim_generation=None) -> bool:
         with self._conn() as conn:
-            return self._complete_with_conn(conn, effect_id, result, observation_event_id)
+            return self._complete_with_conn(
+                conn, effect_id, result, observation_event_id,
+                worker_id=worker_id, claim_generation=claim_generation)
 
-    def mark_unknown(self, effect_id, error: Optional[str] = None) -> bool:
-        """Quarantine an ambiguous effect. Never overwrites a recorded outcome."""
+    def mark_unknown(self, effect_id, error: Optional[str] = None, *,
+                     worker_id=None, claim_generation=None) -> bool:
+        """Quarantine only the exact active claim that observed ambiguity."""
+        worker_id, claim_generation = self._require_claim_token(worker_id, claim_generation)
         with self._conn() as conn:
             changed = conn.execute("""
               UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
                 lease_expires_at=NULL, updated_at=?
               WHERE effect_id=? AND status='CLAIMED'
-            """, (str(error)[:500] if error else None, _utcnow(), effect_id)).rowcount
+                AND worker_id=? AND claim_generation=?
+            """, (str(error)[:500] if error else None, _utcnow(),
+                  effect_id, worker_id, claim_generation)).rowcount
         return bool(changed)
 
-    def record_transient_failure(self, effect_id, error: Optional[str] = None) -> Dict[str, Any]:
-        """Bounded-retry accounting for a failure known not to have executed.
+    def record_transient_failure(self, effect_id, error: Optional[str] = None, *,
+                                 worker_id=None, claim_generation=None) -> Dict[str, Any]:
+        """Account a confirmed non-execution failure for the exact active claim.
 
         Returns the record to READY while attempts remain, otherwise moves it
-        to FAILED (dead-letter queue): terminal, never auto-retried. Callers
-        must only use this when the provider confirms non-execution; ambiguous
-        failures go to UNKNOWN via mark_unknown(), never here.
+        to FAILED (dead-letter queue). Ambiguous failures must use mark_unknown.
         """
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
             if row is None:
                 raise KeyError(f"unknown effect_id: {effect_id}")
-            # attempts were already counted by claim(); this only decides
-            # whether the budget is exhausted. A failure after the final
-            # allowed attempt dead-letters the record.
+            worker_id, claim_generation = self._require_claim_token(
+                worker_id, claim_generation)
             attempts = int(row["attempts"])
             status = "FAILED" if attempts >= int(row["max_attempts"]) else "READY"
-            # A stale failure callback must never resurrect a terminal,
-            # completed, or quarantined effect. Require an active claim.
             changed = conn.execute("""
               UPDATE effect_outbox SET status=?, error=?,
                 worker_id=NULL, lease_expires_at=NULL, updated_at=?
               WHERE effect_id=? AND status='CLAIMED'
-            """, (status, str(error)[:500] if error else None, _utcnow(), effect_id)).rowcount
+                AND worker_id=? AND claim_generation=?
+            """, (status, str(error)[:500] if error else None, _utcnow(),
+                  effect_id, worker_id, claim_generation)).rowcount
             if changed != 1:
                 raise ValueError(
-                    f"effect {effect_id} is not CLAIMED; refusing transient-failure transition")
+                    f"effect {effect_id} claim token is stale or no longer CLAIMED")
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
         return self._row_dict(row)
 
@@ -666,6 +715,9 @@ class CognitiveScheduler:
         self.stack=stack; self.physiology=physiology; self.db_path=Path(db_path)
         self.queue=PersistentCognitiveQueue(self.db_path)
         self.outbox=self.queue.outbox
+        # Unique for this scheduler lifetime and persisted with each claim.
+        # claim_generation fences retries within the same incarnation.
+        self.worker_incarnation_id = uuid.uuid4().hex
         # Crash-injection hook (tests only): called with the effect ID after
         # a successful dispatch and before the result is committed. Raising
         # BaseException here simulates a process kill in that window.
@@ -807,10 +859,13 @@ class CognitiveScheduler:
             return {"executed":None,"status":"BLOCKED_DLQ","capability":capability,
                     "effect_id":effect_id}
         # 3. Concurrency-safe claim: exactly one worker may dispatch.
-        worker_id=f"scheduler-{id(self)}-tick{self.current_tick}"
-        if not self.outbox.claim(effect_id,worker_id,lease_seconds=self.outbox_lease_seconds):
+        worker_id=f"scheduler-{self.worker_incarnation_id}"
+        claim_token=self.outbox.claim_with_token(
+            effect_id,worker_id,lease_seconds=self.outbox_lease_seconds)
+        if claim_token is None:
             return {"executed":None,"status":"BLOCKED_CLAIMED","capability":capability,
                     "effect_id":effect_id}
+        claim_generation=claim_token["claim_generation"]
         proposal=ActionProposal(
           name=capability,capability=capability,provenance="victor-cognitive-scheduler",
           required_authorities=("local_owner",),consequence=.08,irreversibility=.05,
@@ -824,7 +879,9 @@ class CognitiveScheduler:
         # Governance rejected before the executor ran: provably no effect,
         # so release the claim and record the rejection exactly as before.
         if d.status.value=="REJECTED":
-            self.outbox.release_claim(effect_id)
+            if not self.outbox.release_claim(
+                effect_id,worker_id=worker_id,claim_generation=claim_generation):
+                raise RuntimeError("outbox claim changed before governance rejection release")
         # A provider timeout / connection failure is ambiguous: the effect
         # may or may not have happened. Quarantine it; never record a
         # terminal outcome and never auto-retry.
@@ -832,8 +889,11 @@ class CognitiveScheduler:
             outcome=d.actual_outcome or {}
             error_type=str(outcome.get("error_type",""))
             if error_type in _AMBIGUOUS_ERROR_TYPES:
-                self.outbox.mark_unknown(
-                    effect_id,f"ambiguous provider failure: {error_type}: {outcome.get('error','')}")
+                if not self.outbox.mark_unknown(
+                    effect_id,
+                    f"ambiguous provider failure: {error_type}: {outcome.get('error','')}",
+                    worker_id=worker_id,claim_generation=claim_generation):
+                    raise RuntimeError("outbox claim changed before ambiguous failure quarantine")
                 raise RuntimeError(
                     f"ambiguous provider failure for effect {effect_id} "
                     f"({error_type}); requires reconciliation")
@@ -874,7 +934,8 @@ class CognitiveScheduler:
                 raise RuntimeError("durable observation id collision")
             if record_outcome:
                 if not EffectOutbox._complete_with_conn(
-                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id):
+                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id,
+                    worker_id=worker_id,claim_generation=claim_generation):
                     raise RuntimeError("outbox claim changed before completion; rolling back result")
         return {"executed":result,"status":d.status.value}
 
