@@ -936,6 +936,20 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
     queue_claim = scheduler.queue.claim_item(item_id, worker_id="worker-a")
     assert queue_claim is not None
 
+    thought_id = "atomic-recovery-thought"
+    thought = CognitiveItem(
+        id=thought_id,
+        kind=ItemKind.THOUGHT,
+        content={"text": "recovery thought"},
+        priority=0.4,
+        depth=0,
+        parent_id=None,
+        created_tick=0,
+    )
+    assert scheduler.queue.push(thought)
+    thought_claim = scheduler.queue.claim_item(thought_id, worker_id="worker-a")
+    assert thought_claim is not None
+
     effect_id = stable_effect_id("memory.commit_reflection", item_id)
     scheduler.outbox.record_intent(
         effect_id,
@@ -963,6 +977,10 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
             "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
             (item_id,),
         ).fetchone()
+        thought_row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            (thought_id,),
+        ).fetchone()
         outbox_row = conn.execute(
             "SELECT status,worker_id,claim_generation FROM effect_outbox WHERE effect_id=?",
             (effect_id,),
@@ -970,6 +988,9 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
     assert queue_row["status"] == ItemStatus.PROCESSING.value
     assert queue_row["worker_id"] == queue_claim.worker_id
     assert queue_row["claim_generation"] == queue_claim.claim_generation
+    assert thought_row["status"] == ItemStatus.PROCESSING.value
+    assert thought_row["worker_id"] == thought_claim.worker_id
+    assert thought_row["claim_generation"] == thought_claim.claim_generation
     assert outbox_row["status"] == "CLAIMED"
     assert outbox_row["worker_id"] == effect_claim["worker_id"]
     assert outbox_row["claim_generation"] == effect_claim["claim_generation"]
@@ -977,7 +998,7 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
     recovered = scheduler.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
     assert recovered == {
         "quarantined_actions": 1,
-        "requeued_cognition": 0,
+        "requeued_cognition": 1,
         "quarantined_effects": 1,
     }
     with scheduler._conn() as conn:
@@ -985,12 +1006,18 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
             "SELECT status,worker_id FROM cognitive_queue WHERE id=?",
             (item_id,),
         ).fetchone()
+        thought_row = conn.execute(
+            "SELECT status,worker_id FROM cognitive_queue WHERE id=?",
+            (thought_id,),
+        ).fetchone()
         outbox_row = conn.execute(
             "SELECT status,worker_id FROM effect_outbox WHERE effect_id=?",
             (effect_id,),
         ).fetchone()
     assert queue_row["status"] == ItemStatus.UNKNOWN.value
     assert queue_row["worker_id"] is None
+    assert thought_row["status"] == ItemStatus.PENDING.value
+    assert thought_row["worker_id"] is None
     assert outbox_row["status"] == "UNKNOWN"
     assert outbox_row["worker_id"] is None
 
