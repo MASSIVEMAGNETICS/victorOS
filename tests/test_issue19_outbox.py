@@ -624,3 +624,18 @@ def test_dispatch_completion_state_change_rolls_back_result_and_observation(tmp_
             "SELECT COUNT(*) FROM cognitive_queue WHERE kind=?",
             (ItemKind.OBSERVATION.value,),
         ).fetchone()[0] == 0
+
+
+def test_unclaimed_intent_cannot_be_quarantined_by_stale_callback(tmp_path):
+    """Only an active dispatch may report an ambiguous provider outcome."""
+    outbox = EffectOutbox(tmp_path / "unknown-guard.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "unknown-guard")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "unknown-guard", "digest"
+    )
+    before = outbox.get(effect_id)
+    assert outbox.mark_unknown(effect_id, "stale callback") is False
+    assert outbox.get(effect_id) == before
+    assert outbox.claim(effect_id, "worker-current") is True
+    assert outbox.mark_unknown(effect_id, "provider timeout") is True
+    assert outbox.get(effect_id)["status"] == "UNKNOWN"
