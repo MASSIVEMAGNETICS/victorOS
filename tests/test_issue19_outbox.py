@@ -897,7 +897,7 @@ def test_action_candidate_stale_callback_cannot_mutate_reconciled_new_claim(tmp_
 
     second = PersistentCognitiveQueue(path)
     recovery = second.recover_after_confirmed_shutdown(confirmed_terminated=True)
-    assert recovery["unknown_actions"] == 1
+    assert recovery["quarantined_actions"] == 1
     second.reconcile_mark("action-generation-item", ItemStatus.PENDING)
     current = second.claim_item("action-generation-item", worker_id="worker-b")
     assert current is not None
