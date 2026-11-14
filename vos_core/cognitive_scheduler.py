@@ -351,15 +351,20 @@ class EffectOutbox:
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
         return self._row_dict(row)
 
+    @staticmethod
+    def _recover_claimed_to_unknown_with_conn(conn) -> int:
+        """Quarantine every claimed effect using the caller's transaction."""
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='UNKNOWN', worker_id=NULL,
+            lease_expires_at=NULL, updated_at=?
+          WHERE status='CLAIMED'
+        """, (_utcnow(),)).rowcount
+        return int(changed)
+
     def recover_claimed_to_unknown(self) -> int:
         """Restart recovery: every in-flight claim is ambiguous after a crash."""
         with self._conn() as conn:
-            changed = conn.execute("""
-              UPDATE effect_outbox SET status='UNKNOWN', worker_id=NULL,
-                lease_expires_at=NULL, updated_at=?
-              WHERE status='CLAIMED'
-            """, (_utcnow(),)).rowcount
-        return int(changed)
+            return self._recover_claimed_to_unknown_with_conn(conn)
 
     def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
                   observation_event_id=None) -> Dict[str, Any]:
@@ -441,6 +446,9 @@ class PersistentCognitiveQueue:
         """
         if confirmed_terminated is not True:
             raise PermissionError("recovery requires confirmed termination of all previous workers")
+        # Queue and outbox rows share this SQLite database. Keep all recovery
+        # transitions in one transaction so an interrupted recovery cannot
+        # leave the local projections in different states.
         with self._conn() as conn:
             action_count = conn.execute(
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=? AND kind=?",
@@ -451,7 +459,7 @@ class PersistentCognitiveQueue:
                 "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
             ).rowcount
-        effect_count = self.outbox.recover_claimed_to_unknown()
+            effect_count = EffectOutbox._recover_claimed_to_unknown_with_conn(conn)
         return {"quarantined_actions": int(action_count),
                 "requeued_cognition": int(cognition_count),
                 "quarantined_effects": effect_count}
