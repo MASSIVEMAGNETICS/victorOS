@@ -238,4 +238,32 @@ These are GitHub-hosted CI results. No local pytest run is claimed. The workflow
 - Recovery remains operator-gated. The `confirmed_terminated=True` argument is still an external assertion, not independent proof of process termination. Fencing prevents stale state transitions; it does not prove that a live process stopped performing non-transactional reasoning work.
 - Earlier code/test commit `339cc910c94ed744e0cc70ce98c34952d501ffb1` passed 156 tests on Python 3.10, 3.11, and 3.12 in run #43630799647. The action-candidate-specific stale-callback test was added in commit `1edae8f9c9a581c01d2065b398fad947edcc25e0`. Its first run (#43631422191, head `07d88cffc2214edf37987c0c17efaca210c5fbfc`) executed 156 tests successfully and failed only the new test's assertion because it expected `unknown_actions`; the recovery API returns `quarantined_actions`. The assertion was corrected in commit `bc673cb7bf9fba81c75f0ee5d74478ca34c2d924`. The corrected code/test head `29ee4d3df0518249db82ff70df3661e83ba5fbe2` passed **157 tests on each of Python 3.10, 3.11, and 3.12** in [GitHub Actions run #43631519150](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43631519150). Python 3.12 reported 108 deprecation warnings; the workflow also reports Node.js 20 action deprecation notices.
 - Provider-receipt authenticity and distributed exactly-once external execution remain unresolved.
+## 2026-11-14: atomic confirmed-shutdown recovery (draft)
+
+This update supersedes the earlier split-transaction recovery limitation
+recorded above. The recovery method now applies the cognitive queue
+transitions and the outbox CLAIMED-to-UNKNOWN quarantine through the same
+SQLite connection and transaction. If any part of the recovery raises, the
+transaction rolls back both tables together.
+
+The new regression test
+`test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox`
+injects a failure after the queue updates and verifies that both the queue
+claim and outbox claim remain unchanged; it then verifies a successful
+recovery moves the action candidate and effect to UNKNOWN together.
+
+The operator gate is unchanged: `confirmed_terminated=True` is still a
+caller assertion, not independent proof that all workers have terminated.
+Recovery must only be invoked after exclusive termination is established.
+This change does not authenticate provider receipts or establish exactly-once
+external execution. UNKNOWN effects remain quarantined pending the existing
+reconciliation and human-approval gates.
+
+**Verification:** Exact-head GitHub Actions is pending for this addendum. No
+local test run is claimed. Require the targeted outbox suite, full `tests/`
+suite, and Python 3.10/3.11/3.12 CI before merge. Keep PR #22 draft and
+unmerged pending independent review and explicit founder approval.
+
+**Rollback:** Revert the three commits for this addendum on the draft branch.
+No production database migration or production state change is performed.
 
