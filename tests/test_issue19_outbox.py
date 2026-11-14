@@ -919,3 +919,78 @@ def test_action_candidate_stale_callback_cannot_mutate_reconciled_new_claim(tmp_
         "action-generation-item", ItemStatus.COMPLETED,
         worker_id=current.worker_id, claim_generation=current.claim_generation
     ) is True
+
+def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path):
+    _, _, scheduler = runtime(tmp_path)
+    item_id = "atomic-recovery-action"
+    item = CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.9,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(item)
+    queue_claim = scheduler.queue.claim_item(item_id, worker_id="worker-a")
+    assert queue_claim is not None
+
+    effect_id = stable_effect_id("memory.commit_reflection", item_id)
+    scheduler.outbox.record_intent(
+        effect_id,
+        "memory.commit_reflection",
+        item_id,
+        "atomic-recovery-digest",
+        queue_item_id=item_id,
+    )
+    effect_claim = claim_args(scheduler.outbox, effect_id, "worker-a")
+
+    def fail_outbox_recovery(conn):
+        raise RuntimeError("simulated outbox quarantine failure")
+
+    with mock.patch.object(
+        EffectOutbox,
+        "_recover_claimed_to_unknown_with_conn",
+        side_effect=fail_outbox_recovery,
+    ):
+        with pytest.raises(RuntimeError, match="simulated outbox quarantine failure"):
+            scheduler.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
+
+    # Failure after the queue UPDATEs must roll back both tables.
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone()
+        outbox_row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM effect_outbox WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+    assert queue_row["status"] == ItemStatus.PROCESSING.value
+    assert queue_row["worker_id"] == queue_claim.worker_id
+    assert queue_row["claim_generation"] == queue_claim.claim_generation
+    assert outbox_row["status"] == "CLAIMED"
+    assert outbox_row["worker_id"] == effect_claim["worker_id"]
+    assert outbox_row["claim_generation"] == effect_claim["claim_generation"]
+
+    recovered = scheduler.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
+    assert recovered == {
+        "quarantined_actions": 1,
+        "requeued_cognition": 0,
+        "quarantined_effects": 1,
+    }
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status,worker_id FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone()
+        outbox_row = conn.execute(
+            "SELECT status,worker_id FROM effect_outbox WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+    assert queue_row["status"] == ItemStatus.UNKNOWN.value
+    assert queue_row["worker_id"] is None
+    assert outbox_row["status"] == "UNKNOWN"
+    assert outbox_row["worker_id"] is None
+
