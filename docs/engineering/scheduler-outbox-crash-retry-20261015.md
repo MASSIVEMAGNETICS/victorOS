@@ -223,4 +223,6 @@ These are GitHub-hosted CI results. No local pytest run is claimed. The workflow
 
 **Rollback:** Revert the code, test, and documentation commits on this draft branch. Do not reverse a production migration or alter production data as part of this draft rollback.
 
+**Scope limit:** This change fences `effect_outbox` claim callbacks only. `cognitive_queue` PROCESSING rows do not yet carry owner/generation tokens; the separate live queue-item ownership-fencing acceptance cases remain unimplemented. Do not describe the full scheduler multi-worker ownership contract as complete.
+
 **Approval:** Draft only. Require independent review of all token-bearing callback paths, production migration planning, provider-authenticated reconciliation, and explicit founder approval before merge or deployment.
