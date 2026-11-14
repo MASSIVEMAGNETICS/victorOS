@@ -64,13 +64,14 @@ def test_human_stop_blocks_capability_execution(tmp_path):
     r=s.tick(max_items=1)
     assert r["execution"]["status"]=="REJECTED"
     assert "human_stop_active" in r["execution"]["executed"]["reasons"]
+    effect_id = r["execution"]["executed"]["effect_id"]
     with s._conn() as conn:
         rejected = conn.execute("""
             SELECT q.status AS queue_status, o.status AS outbox_status
             FROM cognitive_queue q
             JOIN effect_outbox o ON o.queue_item_id=q.id
-            WHERE q.kind=? ORDER BY q.created_at DESC LIMIT 1
-        """, (ItemKind.ACTION_CANDIDATE.value,)).fetchone()
+            WHERE o.effect_id=?
+        """, (effect_id,)).fetchone()
     assert rejected["queue_status"] == ItemStatus.COMPLETED.value
     assert rejected["outbox_status"] == "READY"
 
@@ -97,13 +98,14 @@ def test_execution_observation_reenters_queue_and_closes_loop(tmp_path):
     assert first["generated_thoughts"]==1
     second=s.tick(max_items=1)
     assert second["execution"]["status"]=="EXECUTED"
+    effect_id = second["execution"]["executed"]["effect_id"]
     with s._conn() as conn:
         completed_action = conn.execute("""
             SELECT q.status AS queue_status, o.status AS outbox_status
             FROM cognitive_queue q
             JOIN effect_outbox o ON o.queue_item_id=q.id
-            WHERE q.kind=? ORDER BY q.created_at DESC LIMIT 1
-        """, (ItemKind.ACTION_CANDIDATE.value,)).fetchone()
+            WHERE o.effect_id=?
+        """, (effect_id,)).fetchone()
     assert completed_action["queue_status"] == ItemStatus.COMPLETED.value
     assert completed_action["outbox_status"] == "COMPLETED"
     executed=second["execution"]["executed"]
