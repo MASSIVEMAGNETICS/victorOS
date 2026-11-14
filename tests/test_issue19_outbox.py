@@ -13,6 +13,7 @@ auto-replayed. Only ``reconcile_effect()`` with a provider outcome moves
 it, and a second dispatch after a confirmed execution must not happen.
 """
 
+import sqlite3
 from unittest import mock
 
 import pytest
@@ -73,6 +74,12 @@ def counting_registry(scheduler):
 
     scheduler.registry.execute = counting
     return calls
+
+def claim_args(outbox, effect_id, worker_id, lease_seconds=30):
+    """Acquire and return the exact fencing token required by callbacks."""
+    token = outbox.claim_with_token(effect_id, worker_id, lease_seconds=lease_seconds)
+    assert token is not None
+    return token
 
 
 def test_stable_effect_id_and_payload_digest_conflict(tmp_path):
@@ -338,17 +345,17 @@ def test_retry_budget_reaches_dlq_and_stops_claims(tmp_path):
     from vos_core.cognitive_scheduler import _payload_digest
     s.outbox.record_intent(effect_id, cand["capability"], "source-1",
                            _payload_digest(cand["payload"]))
-    assert s.outbox.claim(effect_id, "worker-a") is True
-    first = s.outbox.record_transient_failure(effect_id, "provider 503")
+    token = claim_args(s.outbox, effect_id, "worker-a")
+    first = s.outbox.record_transient_failure(effect_id, "provider 503", **token)
     assert first["status"] == "READY"
-    assert first["attempts"] == 1  # the claim counted as attempt 1
-    assert s.outbox.claim(effect_id, "worker-a") is True
-    second = s.outbox.record_transient_failure(effect_id, "provider 503")
+    assert first["attempts"] == 1
+    token = claim_args(s.outbox, effect_id, "worker-a")
+    second = s.outbox.record_transient_failure(effect_id, "provider 503", **token)
     assert second["status"] == "READY"
     assert second["attempts"] == 2
-    assert s.outbox.claim(effect_id, "worker-a") is True
-    last = s.outbox.record_transient_failure(effect_id, "provider 503")
-    assert last["status"] == "FAILED"  # DLQ
+    token = claim_args(s.outbox, effect_id, "worker-a")
+    last = s.outbox.record_transient_failure(effect_id, "provider 503", **token)
+    assert last["status"] == "FAILED"
     assert last["attempts"] == 3
     assert s.outbox.claim(effect_id, "worker-a") is False
     assert s._execute([cand])["status"] == "BLOCKED_DLQ"
@@ -427,8 +434,8 @@ def test_unknown_reconciliation_transitions_once(tmp_path):
     effect_id = stable_effect_id("memory.commit_reflection", "once")
     scheduler.outbox.record_intent(
         effect_id, "memory.commit_reflection", "once", "digest")
-    assert scheduler.outbox.claim(effect_id, "worker-a")
-    assert scheduler.outbox.mark_unknown(effect_id, "timeout")
+    token = claim_args(scheduler.outbox, effect_id, "worker-a")
+    assert scheduler.outbox.mark_unknown(effect_id, "timeout", **token)
     result = scheduler.outbox.reconcile(
         effect_id, "not_executed", provider_receipt="provider-confirmed-none")
     assert result["status"] == "READY"
@@ -441,24 +448,27 @@ def test_unknown_reconciliation_transitions_once(tmp_path):
 
 @pytest.mark.parametrize("terminal_state", ["READY", "UNKNOWN", "FAILED", "COMPLETED"])
 def test_transient_failure_cannot_resurrect_non_claimed_effect(tmp_path, terminal_state):
-    """Late failure callbacks cannot clear quarantine or terminal outcomes."""
+    """Late failure callbacks cannot mutate a released or terminal generation."""
     _, _, scheduler = runtime(tmp_path)
     effect_id = stable_effect_id("memory.commit_reflection", terminal_state)
     scheduler.outbox.record_intent(
         effect_id, "memory.commit_reflection", terminal_state, "digest")
-    if terminal_state != "READY":
-        assert scheduler.outbox.claim(effect_id, "worker-a")
-        if terminal_state == "UNKNOWN":
-            assert scheduler.outbox.mark_unknown(effect_id, "ambiguous")
-        elif terminal_state == "FAILED":
-            with scheduler.outbox._conn() as conn:
-                conn.execute("UPDATE effect_outbox SET status='FAILED' WHERE effect_id=?",
-                             (effect_id,))
-        else:
-            assert scheduler.outbox.complete(effect_id, {"ok": True}, "obs-terminal")
+    token = claim_args(scheduler.outbox, effect_id, "worker-a")
+    if terminal_state == "READY":
+        assert scheduler.outbox.release_claim(effect_id, **token)
+    elif terminal_state == "UNKNOWN":
+        assert scheduler.outbox.mark_unknown(effect_id, "ambiguous", **token)
+    elif terminal_state == "FAILED":
+        with scheduler.outbox._conn() as conn:
+            conn.execute("UPDATE effect_outbox SET status='FAILED' WHERE effect_id=?",
+                         (effect_id,))
+    else:
+        assert scheduler.outbox.complete(
+            effect_id, {"ok": True}, "obs-terminal", **token)
     before = scheduler.outbox.get(effect_id)
-    with pytest.raises(ValueError, match="not CLAIMED"):
-        scheduler.outbox.record_transient_failure(effect_id, "late failure")
+    with pytest.raises(ValueError, match="stale or no longer CLAIMED"):
+        scheduler.outbox.record_transient_failure(
+            effect_id, "late failure", **token)
     assert scheduler.outbox.get(effect_id) == before
 
 
@@ -580,28 +590,28 @@ def test_expired_claim_recovery_quarantines_before_any_retry(tmp_path):
 
 
 def test_direct_completion_requires_active_claim_and_preserves_quarantine(tmp_path):
-    """Neither an unclaimed intent nor UNKNOWN can be completed by a callback."""
+    """Completion requires a fencing token and cannot clear UNKNOWN."""
     outbox = EffectOutbox(tmp_path / "completion-guard.db")
     effect_id = stable_effect_id("memory.commit_reflection", "completion-guard")
     outbox.record_intent(
         effect_id, "memory.commit_reflection", "completion-guard", "digest"
     )
     before = outbox.get(effect_id)
-    assert outbox.complete(effect_id, {"ok": True}, "obs-unclaimed") is False
+    with pytest.raises(ValueError, match="worker_id is required"):
+        outbox.complete(effect_id, {"ok": True}, "obs-unclaimed")
     assert outbox.get(effect_id) == before
 
-    assert outbox.claim(effect_id, "worker-original")
-    assert outbox.mark_unknown(effect_id, "provider timeout")
+    token = claim_args(outbox, effect_id, "worker-original")
+    assert outbox.mark_unknown(effect_id, "provider timeout", **token)
     quarantined = outbox.get(effect_id)
-    assert outbox.complete(effect_id, {"ok": True}, "obs-stale") is False
+    assert outbox.complete(effect_id, {"ok": True}, "obs-stale", **token) is False
     assert outbox.get(effect_id) == quarantined
 
-    # Only explicit reconciliation may move UNKNOWN to COMPLETED.
     reconciled = outbox.reconcile(
         effect_id, "executed", provider_receipt="operator-supplied-receipt"
     )
     assert reconciled["status"] == "COMPLETED"
-    assert outbox.complete(effect_id, {"ok": True}, "obs-duplicate") is False
+    assert outbox.complete(effect_id, {"ok": True}, "obs-duplicate", **token) is False
 
 
 def test_dispatch_completion_state_change_rolls_back_result_and_observation(tmp_path):
@@ -612,7 +622,10 @@ def test_dispatch_completion_state_change_rolls_back_result_and_observation(tmp_
 
     def quarantine_before_commit(dispatched_effect_id):
         assert dispatched_effect_id == effect_id
-        assert scheduler.outbox.mark_unknown(effect_id, "simulated concurrent recovery")
+        row = scheduler.outbox.get(effect_id)
+        assert scheduler.outbox.mark_unknown(
+            effect_id, "simulated concurrent recovery",
+            worker_id=row["worker_id"], claim_generation=row["claim_generation"])
 
     scheduler.crash_hook = quarantine_before_commit
     with pytest.raises(RuntimeError, match="claim changed before completion"):
@@ -627,15 +640,91 @@ def test_dispatch_completion_state_change_rolls_back_result_and_observation(tmp_
 
 
 def test_unclaimed_intent_cannot_be_quarantined_by_stale_callback(tmp_path):
-    """Only an active dispatch may report an ambiguous provider outcome."""
+    """A callback without the current owner/generation cannot quarantine an intent."""
     outbox = EffectOutbox(tmp_path / "unknown-guard.db")
     effect_id = stable_effect_id("memory.commit_reflection", "unknown-guard")
     outbox.record_intent(
         effect_id, "memory.commit_reflection", "unknown-guard", "digest"
     )
     before = outbox.get(effect_id)
-    assert outbox.mark_unknown(effect_id, "stale callback") is False
+    assert outbox.mark_unknown(
+        effect_id, "stale callback", worker_id="worker-current",
+        claim_generation=1) is False
     assert outbox.get(effect_id) == before
-    assert outbox.claim(effect_id, "worker-current") is True
-    assert outbox.mark_unknown(effect_id, "provider timeout") is True
+    token = claim_args(outbox, effect_id, "worker-current")
+    assert outbox.mark_unknown(effect_id, "provider timeout", **token) is True
     assert outbox.get(effect_id)["status"] == "UNKNOWN"
+
+
+def test_stale_claim_generation_cannot_mutate_reacquired_claim(tmp_path):
+    """The same owner cannot use an earlier generation after release/reclaim."""
+    outbox = EffectOutbox(tmp_path / "generation-fence.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "generation-fence")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "generation-fence", "digest"
+    )
+    first = claim_args(outbox, effect_id, "same-worker")
+    assert outbox.release_claim(effect_id, **first) is True
+
+    second = claim_args(outbox, effect_id, "same-worker")
+    assert second["claim_generation"] == first["claim_generation"] + 1
+    before = outbox.get(effect_id)
+
+    assert outbox.release_claim(effect_id, **first) is False
+    assert outbox.mark_unknown(effect_id, "late timeout", **first) is False
+    assert outbox.complete(effect_id, {"ok": True}, "obs-stale", **first) is False
+    with pytest.raises(ValueError, match="stale or no longer CLAIMED"):
+        outbox.record_transient_failure(effect_id, "late failure", **first)
+    assert outbox.get(effect_id) == before
+
+    assert outbox.mark_unknown(effect_id, "current timeout", **second) is True
+    assert outbox.get(effect_id)["status"] == "UNKNOWN"
+
+
+def test_legacy_outbox_schema_adds_claim_generation_without_losing_rows(tmp_path):
+    """Existing databases gain the fencing column additively and fail closed."""
+    path = tmp_path / "legacy-outbox.db"
+    effect_id = stable_effect_id("memory.commit_reflection", "legacy-row")
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE effect_outbox(
+                effect_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL,
+                source_item_id TEXT,
+                queue_item_id TEXT,
+                payload_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                worker_id TEXT,
+                lease_expires_at TEXT,
+                result_json TEXT,
+                observation_event_id TEXT UNIQUE,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX idx_outbox_status ON effect_outbox(status, created_at ASC)"
+        )
+        conn.execute("""
+            INSERT INTO effect_outbox(
+                effect_id, capability, source_item_id, queue_item_id,
+                payload_digest, idempotency_key, status, attempts,
+                max_attempts, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,'READY',0,3,?,?)
+        """, (effect_id, "memory.commit_reflection", "legacy-row", None,
+              "digest", effect_id, "2026-11-14T00:00:00+00:00",
+              "2026-11-14T00:00:00+00:00"))
+
+    outbox = EffectOutbox(path)
+    legacy = outbox.get(effect_id)
+    assert legacy is not None
+    assert legacy["claim_generation"] == 0
+    token = outbox.claim_with_token(effect_id, "legacy-worker")
+    assert token == {"worker_id": "legacy-worker", "claim_generation": 1}
+    with outbox._conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(effect_outbox)")}
+    assert "claim_generation" in columns
