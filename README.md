@@ -121,7 +121,7 @@ python -m pytest tests/ -v
 
 Alternatively, `pytest tests/ -v` can be run directly as `conftest.py` adds the necessary path resolution.
 
-43 tests covering: `GodTierVersion`, `SAVE3Trust`, `AuditLedger`, `MetadataEngine`, `RolloutScheduler`, `SyntheticCognitiveCore`, `PredictiveCoder`, `SymbolicRouter`, `ContradictionResolver`, `FractalNode`, and `VOSApp Registry`.
+The suite covers `GodTierVersion`, `SAVE3Trust`, `AuditLedger`, `MetadataEngine`, `RolloutScheduler`, `SyntheticCognitiveCore`, `PredictiveCoder`, `SymbolicRouter`, `ContradictionResolver`, `FractalNode`, and `VOSApp Registry`. Use the pytest summary for the current test count; it changes as regression coverage grows.
 
 ---
 
