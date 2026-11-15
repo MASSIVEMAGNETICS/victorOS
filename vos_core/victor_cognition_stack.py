@@ -22,7 +22,6 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 APP_NAME = "Victor Cognition Stack"
 VERSION = "1.0.0"
@@ -964,7 +963,7 @@ class VictorCognitionStack:
             out.append(d)
         return out
 
-    def actions(self, connection: Optional[sqlite3.Connection] = None):
+    def actions(self, connection=None):
         owns_connection = connection is None
         conn = connection if connection is not None else self._conn()
         try:
