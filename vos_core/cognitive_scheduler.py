@@ -891,7 +891,9 @@ class CognitiveScheduler:
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path,timeout=30); conn.row_factory=sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;"); return conn
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
 
     def _load_tick(self):
         with self._conn() as conn:
