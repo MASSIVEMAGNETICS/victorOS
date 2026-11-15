@@ -1064,3 +1064,123 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
     assert outbox_row["status"] == "UNKNOWN"
     assert outbox_row["worker_id"] is None
 
+
+
+def _prepare_unknown_queue_effect(scheduler, item_id):
+    """Create a linked UNKNOWN action/outbox pair for reconciliation tests."""
+    item = CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(item)
+    queue_claim = scheduler.queue.claim_item(item_id, worker_id="reconcile-worker")
+    assert queue_claim is not None
+    assert scheduler.queue.mark_claimed(
+        item_id,
+        ItemStatus.UNKNOWN,
+        worker_id=queue_claim.worker_id,
+        claim_generation=queue_claim.claim_generation,
+    )
+    effect_id = stable_effect_id("memory.commit_reflection", item_id)
+    scheduler.outbox.record_intent(
+        effect_id,
+        "memory.commit_reflection",
+        item_id,
+        "reconciliation-test-digest",
+        queue_item_id=item_id,
+    )
+    effect_claim = claim_args(scheduler.outbox, effect_id, "reconcile-worker")
+    assert scheduler.outbox.mark_unknown(effect_id, "ambiguous test outcome", **effect_claim)
+    return effect_id
+
+
+@pytest.mark.parametrize(
+    ("outcome", "queue_status", "outbox_status"),
+    [
+        ("executed", ItemStatus.COMPLETED, "COMPLETED"),
+        ("not_executed", ItemStatus.PENDING, "READY"),
+    ],
+)
+def test_reconcile_effect_updates_outbox_and_queue_projection_together(
+    tmp_path, outcome, queue_status, outbox_status
+):
+    _, _, scheduler = runtime(tmp_path)
+    item_id = f"atomic-reconcile-{outcome}"
+    effect_id = _prepare_unknown_queue_effect(scheduler, item_id)
+
+    result = scheduler.reconcile_effect(
+        effect_id, outcome, provider_receipt=f"test-receipt-{outcome}"
+    )
+
+    assert result["status"] == outbox_status
+    assert result["changed"] is True
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?", (item_id,)
+        ).fetchone()
+        outbox_row = conn.execute(
+            "SELECT status FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+    assert queue_row["status"] == queue_status.value
+    assert outbox_row["status"] == outbox_status
+
+
+@pytest.mark.parametrize(
+    ("outcome", "blocked_status"),
+    [
+        ("executed", ItemStatus.COMPLETED.value),
+        ("not_executed", ItemStatus.PENDING.value),
+    ],
+)
+def test_reconcile_effect_rolls_back_outbox_when_queue_projection_fails(
+    tmp_path, outcome, blocked_status
+):
+    _, _, scheduler = runtime(tmp_path)
+    item_id = f"rollback-reconcile-{outcome}"
+    effect_id = _prepare_unknown_queue_effect(scheduler, item_id)
+
+    with scheduler._conn() as conn:
+        conn.execute(f"""
+            CREATE TRIGGER reject_reconciliation_projection
+            BEFORE UPDATE OF status ON cognitive_queue
+            WHEN OLD.id='{item_id}' AND NEW.status='{blocked_status}'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected reconciliation projection failure');
+            END;
+        """)
+        observation_count_before = conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE kind=?",
+            (ItemKind.OBSERVATION.value,),
+        ).fetchone()[0]
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected reconciliation projection failure"):
+        scheduler.reconcile_effect(
+            effect_id, outcome, provider_receipt=f"test-receipt-{outcome}"
+        )
+
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?", (item_id,)
+        ).fetchone()
+        outbox_row = conn.execute(
+            "SELECT status,result_json FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        result_count = conn.execute(
+            "SELECT COUNT(*) FROM capability_results WHERE source_item_id=?",
+            (item_id,),
+        ).fetchone()[0]
+        observation_count_after = conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE kind=?",
+            (ItemKind.OBSERVATION.value,),
+        ).fetchone()[0]
+
+    assert queue_row["status"] == ItemStatus.UNKNOWN.value
+    assert outbox_row["status"] == "UNKNOWN"
+    assert outbox_row["result_json"] is None
+    assert result_count == 0
+    assert observation_count_after == observation_count_before
