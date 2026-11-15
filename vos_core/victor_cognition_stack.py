@@ -22,6 +22,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 APP_NAME = "Victor Cognition Stack"
 VERSION = "1.0.0"
