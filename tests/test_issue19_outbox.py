@@ -1170,6 +1170,35 @@ def _prepare_unknown_queue_effect(scheduler, item_id):
     return effect_id
 
 
+@pytest.mark.parametrize("outcome", ["executed", "not_executed"])
+def test_standalone_outbox_reconcile_rejects_linked_effect(tmp_path, outcome):
+    """Linked queue/outbox projections cannot be split by the standalone API."""
+    _, _, scheduler = runtime(tmp_path)
+    item_id = f"standalone-reconcile-{outcome}"
+    effect_id = _prepare_unknown_queue_effect(scheduler, item_id)
+    before_outbox = scheduler.outbox.get(effect_id)
+
+    with scheduler._conn() as conn:
+        before_queue = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?", (item_id,)
+        ).fetchone()["status"]
+
+    with pytest.raises(
+        RuntimeError,
+        match="linked outbox effects must be reconciled atomically",
+    ):
+        scheduler.outbox.reconcile(
+            effect_id, outcome, provider_receipt="unverified-standalone-receipt"
+        )
+
+    assert scheduler.outbox.get(effect_id) == before_outbox
+    with scheduler._conn() as conn:
+        after_queue = conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?", (item_id,)
+        ).fetchone()["status"]
+    assert before_queue == after_queue == ItemStatus.UNKNOWN.value
+
+
 @pytest.mark.parametrize(
     ("outcome", "queue_status", "outbox_status"),
     [

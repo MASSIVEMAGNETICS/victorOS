@@ -441,12 +441,27 @@ class EffectOutbox:
 
     def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
                   observation_event_id=None) -> Dict[str, Any]:
-        """Explicit reconciliation for an UNKNOWN effect.
+        """Reconcile only a standalone outbox effect with no queue projection.
 
-        The state transition is conditional and can participate in a larger
-        caller-owned SQLite transaction when queue projections must move with it.
+        Linked effects must use CognitiveScheduler.reconcile_effect so the
+        outbox state and cognitive_queue projection change in one transaction.
         """
+        if outcome not in ("executed", "not_executed", "unknown"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
         with self._conn() as conn:
+            # Serialize the link check with any concurrent intent association.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            if outcome != "unknown" and row["queue_item_id"] is not None:
+                raise RuntimeError(
+                    "linked outbox effects must be reconciled atomically through "
+                    "CognitiveScheduler.reconcile_effect"
+                )
             return self._reconcile_with_conn(
                 conn, effect_id, outcome, provider_receipt=provider_receipt,
                 result=result, observation_event_id=observation_event_id)
