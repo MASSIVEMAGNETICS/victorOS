@@ -14,6 +14,8 @@ it, and a second dispatch after a confirmed execution must not happen.
 """
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest import mock
 
 import pytest
@@ -300,6 +302,47 @@ def test_two_worker_claim_race_only_one_dispatches(tmp_path):
     with pytest.raises(RuntimeError, match="requires reconciliation"):
         recovered._execute([cand])
     assert calls == []
+
+
+def test_concurrent_workers_only_one_atomic_claim_succeeds(tmp_path):
+    """Two independently opened workers race; SQLite grants exactly one claim."""
+    db_path = tmp_path / "concurrent-claims.db"
+    worker_a = EffectOutbox(db_path)
+    worker_b = EffectOutbox(db_path)
+    effect_id = stable_effect_id("memory.commit_reflection", "concurrent-claim")
+    worker_a.record_intent(
+        effect_id, "memory.commit_reflection", "concurrent-claim", "digest"
+    )
+
+    start = Barrier(3)
+
+    def claim(outbox, worker_id):
+        start.wait(timeout=10)
+        return outbox.claim_with_token(effect_id, worker_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            "worker-a": executor.submit(claim, worker_a, "worker-a"),
+            "worker-b": executor.submit(claim, worker_b, "worker-b"),
+        }
+        # Release both workers only after both have reached the same barrier.
+        start.wait(timeout=10)
+        results = {worker_id: future.result(timeout=15)
+                   for worker_id, future in futures.items()}
+
+    winners = [(worker_id, token) for worker_id, token in results.items()
+               if token is not None]
+    assert len(winners) == 1
+    winner_id, token = winners[0]
+    assert token == {"worker_id": winner_id, "claim_generation": 1}
+    assert results["worker-b" if winner_id == "worker-a" else "worker-a"] is None
+
+    stored = worker_a.get(effect_id)
+    assert stored["status"] == "CLAIMED"
+    assert stored["worker_id"] == winner_id
+    assert stored["attempts"] == 1
+    assert stored["claim_generation"] == 1
+
 
 def test_provider_timeout_is_ambiguous_not_terminal(tmp_path):
     _, _, s = runtime(tmp_path)
