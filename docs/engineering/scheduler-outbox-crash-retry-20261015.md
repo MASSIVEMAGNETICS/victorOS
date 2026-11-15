@@ -292,3 +292,24 @@ external effects. Provider reconciliation and founder approval gates remain
 unchanged. The longer writer transaction can increase SQLite write contention;
 lock timeouts remain fail-closed rather than bypassing the claim check.
 
+
+
+## 2026-11-15: linked queue projections require atomic reconciliation
+
+The public `PersistentCognitiveQueue.reconcile_mark()` method now acquires
+`BEGIN IMMEDIATE` before checking whether an `effect_outbox` row references
+the queue item. If any link exists, the queue-only API rejects the transition
+and directs callers to `CognitiveScheduler.reconcile_effect()`. This closes
+a public state-transition path that could otherwise update the queue
+projection without committing the corresponding outbox transition.
+
+The writer lock serializes the link check with `record_intent()`, including
+the case where an existing READY standalone intent is being attached to a
+queue item. Unlinked UNKNOWN action candidates retain the explicit queue-only
+recovery path; linked effects must use the existing atomic scheduler method.
+
+Regression coverage attempts both PENDING and COMPLETED queue-only transitions
+against a linked UNKNOWN effect and verifies that both records remain unchanged.
+Existing unlinked recovery tests remain in place. No schema migration,
+dependency, provider-trust claim, model-authority change, deployment, or
+approval-gate change is introduced.
