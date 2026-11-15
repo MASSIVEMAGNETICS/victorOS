@@ -366,59 +366,68 @@ class EffectOutbox:
         with self._conn() as conn:
             return self._recover_claimed_to_unknown_with_conn(conn)
 
-    def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
-                  observation_event_id=None) -> Dict[str, Any]:
-        """Explicit, audited reconciliation for an UNKNOWN effect.
-
-        outcome "executed": record the provider-confirmed outcome.
-        outcome "not_executed": return the record to READY for one safe retry.
-        outcome "unknown": leave it quarantined.
-        Anything else raises ValueError. A COMPLETED record is never
-        contradicted by a "not_executed" claim.
-        """
+    @staticmethod
+    def _reconcile_with_conn(conn, effect_id, outcome, provider_receipt=None,
+                             result=None, observation_event_id=None) -> Dict[str, Any]:
+        """Reconcile one UNKNOWN outbox row inside the caller's transaction."""
         if outcome not in ("executed", "not_executed", "unknown"):
             raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
-            if row is None:
-                raise KeyError(f"unknown effect_id: {effect_id}")
-            current = self._row_dict(row)
-            if outcome == "unknown":
+        row = conn.execute(
+            "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown effect_id: {effect_id}")
+        current = EffectOutbox._row_dict(row)
+        if outcome == "unknown":
+            return {**current, "changed": False}
+        if current["status"] == "COMPLETED":
+            if outcome == "executed":
                 return {**current, "changed": False}
-            if current["status"] == "COMPLETED":
-                if outcome == "executed":
-                    return {**current, "changed": False}
-                raise ValueError(
-                    f"effect {effect_id} already recorded COMPLETED; "
-                    "provider 'not_executed' contradicts the recorded outcome")
-            if current["status"] != "UNKNOWN":
-                raise ValueError(
-                    f"effect {effect_id} in {current['status']} cannot be reconciled; "
-                    "only UNKNOWN effects may transition")
-            if outcome == "not_executed":
-                stored = result if result is not None else {
-                    "reconciled": True, "provider_receipt": provider_receipt,
-                    "outcome": "not_executed"}
-                changed = conn.execute("""
-                  UPDATE effect_outbox SET status='READY', result_json=?, error=NULL,
-                    worker_id=NULL, lease_expires_at=NULL, updated_at=?
-                  WHERE effect_id=? AND status='UNKNOWN'
-                """, (_canonical_json(stored), _utcnow(), effect_id)).rowcount
-            else:
-                stored = result if result is not None else {
-                    "reconciled": True, "provider_receipt": provider_receipt,
-                    "outcome": "executed"}
-                obs_id = observation_event_id or current.get("observation_event_id")
-                changed = conn.execute("""
-                  UPDATE effect_outbox SET status='COMPLETED', result_json=?,
-                    observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
-                  WHERE effect_id=? AND status='UNKNOWN'
-                """, (_canonical_json(stored), obs_id, _utcnow(), effect_id)).rowcount
-            if changed != 1:
-                raise RuntimeError(f"effect {effect_id} reconciliation state changed")
-            return {**self._row_dict(conn.execute(
-                "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()),
-                "changed": True}
+            raise ValueError(
+                f"effect {effect_id} already recorded COMPLETED; "
+                "provider 'not_executed' contradicts the recorded outcome")
+        if current["status"] != "UNKNOWN":
+            raise ValueError(
+                f"effect {effect_id} in {current['status']} cannot be reconciled; "
+                "only UNKNOWN effects may transition")
+        if outcome == "not_executed":
+            stored = result if result is not None else {
+                "reconciled": True, "provider_receipt": provider_receipt,
+                "outcome": "not_executed"}
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='READY', result_json=?, error=NULL,
+                worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='UNKNOWN'
+            """, (_canonical_json(stored), _utcnow(), effect_id)).rowcount
+        else:
+            stored = result if result is not None else {
+                "reconciled": True, "provider_receipt": provider_receipt,
+                "outcome": "executed"}
+            obs_id = observation_event_id or current.get("observation_event_id")
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+                observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='UNKNOWN'
+            """, (_canonical_json(stored), obs_id, _utcnow(), effect_id)).rowcount
+        if changed != 1:
+            raise RuntimeError(f"effect {effect_id} reconciliation state changed")
+        updated = conn.execute(
+            "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        return {**EffectOutbox._row_dict(updated), "changed": True}
+
+    def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
+                  observation_event_id=None) -> Dict[str, Any]:
+        """Explicit reconciliation for an UNKNOWN effect.
+
+        The state transition is conditional and can participate in a larger
+        caller-owned SQLite transaction when queue projections must move with it.
+        """
+        with self._conn() as conn:
+            return self._reconcile_with_conn(
+                conn, effect_id, outcome, provider_receipt=provider_receipt,
+                result=result, observation_event_id=observation_event_id)
+
 
 
 class PersistentCognitiveQueue:
@@ -573,24 +582,34 @@ class PersistentCognitiveQueue:
                                            payload_digest, queue_item_id=item.id)
             return True
 
-    def reconcile_mark(self, item_id: str, status: ItemStatus):
-        """Explicit reconciliation transition for a quarantined action claim.
-
-        Only UNKNOWN ACTION_CANDIDATE -> COMPLETED (provider confirmed the
-        effect) or -> PENDING (provider confirmed non-execution, safe retry)
-        is allowed, and only through this method. The generic mark() API
-        still refuses to move anything out of UNKNOWN.
-        """
+    @staticmethod
+    def _reconcile_mark_with_conn(conn, item_id: str, status: ItemStatus,
+                                  *, allow_already_target: bool = False) -> bool:
+        """Move one UNKNOWN action projection within a caller-owned transaction."""
         if status not in (ItemStatus.COMPLETED, ItemStatus.PENDING):
             raise ValueError("reconciliation may only resolve UNKNOWN to COMPLETED or PENDING")
+        changed = conn.execute("""
+          UPDATE cognitive_queue SET status=?, updated_at=?
+          WHERE id=? AND kind=? AND status=?
+        """, (status.value, _utcnow(), item_id,
+              ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value)).rowcount
+        if changed == 1:
+            return True
+        if allow_already_target:
+            row = conn.execute(
+                "SELECT kind,status FROM cognitive_queue WHERE id=?", (item_id,)
+            ).fetchone()
+            if (row is not None
+                    and row["kind"] == ItemKind.ACTION_CANDIDATE.value
+                    and row["status"] == status.value):
+                return False
+        raise ValueError("only a quarantined UNKNOWN action candidate can be reconciled")
+
+    def reconcile_mark(self, item_id: str, status: ItemStatus):
+        """Explicit reconciliation transition for a quarantined action claim."""
         with self._conn() as conn:
-            changed = conn.execute("""
-              UPDATE cognitive_queue SET status=?, updated_at=?
-              WHERE id=? AND kind=? AND status=?
-            """, (status.value, _utcnow(), item_id,
-                  ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value)).rowcount
-            if not changed:
-                raise ValueError("only a quarantined UNKNOWN action candidate can be reconciled")
+            return self._reconcile_mark_with_conn(conn, item_id, status)
+
 
     @staticmethod
     def _require_claim_token(worker_id, claim_generation):
@@ -1127,83 +1146,120 @@ class CognitiveScheduler:
                     raise RuntimeError("queue claim changed before result commit; rolling back result")
         return {"executed":result,"status":d.status.value}
 
-    def reconcile_effect(self,effect_id, outcome, provider_receipt=None):
-        """Explicit provider reconciliation for an UNKNOWN effect.
+    def reconcile_effect(self, effect_id, outcome, provider_receipt=None):
+        """Reconcile an UNKNOWN effect and its queue projection atomically.
 
-        outcome "executed": provider confirms the effect happened. The
-        recorded outcome is committed (result + observation, deduped on the
-        observation event ID) and the quarantined queue claim resolves to
-        COMPLETED. outcome "not_executed": provider confirms it did not
-        happen; the queue claim returns to PENDING for one safe retry.
-        outcome "unknown": nothing changes. This is the ONLY path out of
-        UNKNOWN; tick() and mark() never auto-retry a quarantined effect.
+        The outbox row, capability result, observation, and linked action queue
+        projection share one SQLite transaction. A crash or failed queue update
+        therefore cannot leave READY/COMPLETED in one table and UNKNOWN in the
+        other. Provider receipt authenticity remains an external approval gate.
         """
-        row=self.outbox.get(effect_id)
-        if row is None:
-            raise KeyError(f"unknown effect_id: {effect_id}")
-        if outcome=="unknown":
-            return {"effect_id":effect_id,"status":row["status"],"outcome":"unknown",
-                    "changed":False}
-        if outcome not in ("executed","not_executed"):
+        if outcome not in ("executed", "not_executed", "unknown"):
             raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
-        if outcome=="not_executed":
-            if row["status"]=="COMPLETED":
-                raise ValueError(
-                    f"effect {effect_id} already recorded COMPLETED; "
-                    "provider 'not_executed' contradicts the recorded outcome")
-            reconciled=self.outbox.reconcile(effect_id,"not_executed",
-                                            provider_receipt=provider_receipt)
-            if row.get("queue_item_id"):
-                try:
-                    self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.PENDING)
-                except ValueError:
-                    pass  # queue claim already resolved; outbox state governs
-            return {"effect_id":effect_id,"status":reconciled["status"],
-                    "outcome":"not_executed","changed":reconciled["changed"]}
-        # outcome == "executed"
-        if row["status"]=="COMPLETED" and row.get("result_json"):
-            if row.get("queue_item_id"):
-                try:
-                    self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.COMPLETED)
-                except ValueError:
-                    pass
-            return {"effect_id":effect_id,"status":"COMPLETED","outcome":"executed",
-                    "changed":False,"executed":json.loads(row["result_json"])}
-        observation_id=row.get("observation_event_id") or uuid.uuid4().hex
-        result={"capability":row["capability"],"decision_status":"EXECUTED",
-          "governance_mode":"GREEN","reasons":["provider_reconciliation"],
-          "receipt_hash":row.get("result_json") and json.loads(row["result_json"]).get("executed",{}).get("receipt_hash"),
-          "outcome":{"ok":True,"result":{"reconciled":True,"provider_receipt":provider_receipt}},
-          "observation_event_id":observation_id,
-          "effect_id":effect_id,"idempotency_key":effect_id}
-        stored={"executed":result,"status":"EXECUTED"}
         with self._conn() as conn:
+            raw = conn.execute(
+                "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+            ).fetchone()
+            if raw is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            row = EffectOutbox._row_dict(raw)
+            if outcome == "unknown":
+                return {"effect_id": effect_id, "status": row["status"],
+                        "outcome": "unknown", "changed": False}
+
+            if row["status"] == "COMPLETED" and row.get("result_json"):
+                if outcome == "not_executed":
+                    raise ValueError(
+                        f"effect {effect_id} already recorded COMPLETED; "
+                        "provider 'not_executed' contradicts the recorded outcome")
+                if row.get("queue_item_id"):
+                    try:
+                        self.queue._reconcile_mark_with_conn(
+                            conn, row["queue_item_id"], ItemStatus.COMPLETED,
+                            allow_already_target=True)
+                    except ValueError:
+                        # Preserve the existing idempotent repair behavior for
+                        # legacy/missing queue projections; do not rewrite them.
+                        pass
+                return {"effect_id": effect_id, "status": "COMPLETED",
+                        "outcome": "executed", "changed": False,
+                        "executed": json.loads(row["result_json"])}
+
+            if row["status"] != "UNKNOWN":
+                raise ValueError(
+                    f"effect {effect_id} in {row['status']} cannot be reconciled; "
+                    "only UNKNOWN effects may transition")
+
+            if outcome == "not_executed":
+                # Update outbox first intentionally: the following queue update
+                # must roll it back if the queue projection is missing or invalid.
+                reconciled = EffectOutbox._reconcile_with_conn(
+                    conn, effect_id, "not_executed",
+                    provider_receipt=provider_receipt)
+                if row.get("queue_item_id"):
+                    self.queue._reconcile_mark_with_conn(
+                        conn, row["queue_item_id"], ItemStatus.PENDING,
+                        allow_already_target=True)
+                return {"effect_id": effect_id, "status": reconciled["status"],
+                        "outcome": "not_executed",
+                        "changed": reconciled["changed"]}
+
+            # outcome == "executed"
+            observation_id = row.get("observation_event_id") or uuid.uuid4().hex
+            result = {
+                "capability": row["capability"],
+                "decision_status": "EXECUTED",
+                "governance_mode": "GREEN",
+                "reasons": ["provider_reconciliation"],
+                "receipt_hash": (
+                    row.get("result_json")
+                    and json.loads(row["result_json"]).get("executed", {}).get("receipt_hash")
+                ),
+                "outcome": {
+                    "ok": True,
+                    "result": {"reconciled": True, "provider_receipt": provider_receipt},
+                },
+                "observation_event_id": observation_id,
+                "effect_id": effect_id,
+                "idempotency_key": effect_id,
+            }
+            stored = {"executed": result, "status": "EXECUTED"}
             conn.execute("""INSERT OR IGNORE INTO capability_results
               (tick,capability,status,payload_json,receipt_hash,observation_event_id,
                source_item_id,source_depth,priority,created_at)
               VALUES(?,?,?,?,?,?,?,?,?,?)""",
-              (self.current_tick,row["capability"],"EXECUTED",_canonical_json(result),
-               result["receipt_hash"],observation_id,row.get("source_item_id"),0,0.5,_utcnow()))
-            observation=CognitiveItem(
-              id=observation_id,kind=ItemKind.OBSERVATION,
-              content={"event_type":"action_observation","capability":row["capability"],
-                "status":"EXECUTED","governance_mode":"GREEN",
-                "reasons":["provider_reconciliation"],
-                "receipt_hash":result["receipt_hash"],
-                "outcome":result["outcome"],"reconciled":True},
-              priority=0.5,depth=1,parent_id=row.get("source_item_id"),
-              created_tick=self.current_tick)
-            self.queue._insert_with_conn(conn,observation)
-            if not EffectOutbox._complete_with_conn(
-                conn,effect_id,stored,observation_id,expected_status="UNKNOWN"):
-                raise RuntimeError("outbox quarantine changed before reconciliation commit")
-        if row.get("queue_item_id"):
-            try:
-                self.queue.reconcile_mark(row["queue_item_id"],ItemStatus.COMPLETED)
-            except ValueError:
-                pass
-        return {"effect_id":effect_id,"status":"COMPLETED","outcome":"executed",
-                "changed":True,"executed":stored}
+              (self.current_tick, row["capability"], "EXECUTED",
+               _canonical_json(result), result["receipt_hash"], observation_id,
+               row.get("source_item_id"), 0, 0.5, _utcnow()))
+            observation = CognitiveItem(
+                id=observation_id,
+                kind=ItemKind.OBSERVATION,
+                content={
+                    "event_type": "action_observation",
+                    "capability": row["capability"],
+                    "status": "EXECUTED",
+                    "governance_mode": "GREEN",
+                    "reasons": ["provider_reconciliation"],
+                    "receipt_hash": result["receipt_hash"],
+                    "outcome": result["outcome"],
+                    "reconciled": True,
+                },
+                priority=0.5,
+                depth=1,
+                parent_id=row.get("source_item_id"),
+                created_tick=self.current_tick,
+            )
+            self.queue._insert_with_conn(conn, observation)
+            reconciled = EffectOutbox._reconcile_with_conn(
+                conn, effect_id, "executed", result=stored,
+                observation_event_id=observation_id)
+            if row.get("queue_item_id"):
+                self.queue._reconcile_mark_with_conn(
+                    conn, row["queue_item_id"], ItemStatus.COMPLETED,
+                    allow_already_target=True)
+            return {"effect_id": effect_id, "status": reconciled["status"],
+                    "outcome": "executed", "changed": reconciled["changed"],
+                    "executed": stored}
 
     def _recover_missing_observations(self):
         """Project legacy committed results into exactly one durable observation."""
