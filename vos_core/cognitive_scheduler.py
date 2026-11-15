@@ -681,8 +681,24 @@ class PersistentCognitiveQueue:
         raise ValueError("only a quarantined UNKNOWN action candidate can be reconciled")
 
     def reconcile_mark(self, item_id: str, status: ItemStatus):
-        """Explicit reconciliation transition for a quarantined action claim."""
+        """Reconcile only an unlinked UNKNOWN action projection.
+
+        Linked effects must use CognitiveScheduler.reconcile_effect() so the
+        outbox and queue projections are committed or rolled back together.
+        """
         with self._conn() as conn:
+            # Serialize the link check with record_intent() attaching an
+            # existing READY effect to this queue item.
+            conn.execute("BEGIN IMMEDIATE")
+            linked = conn.execute(
+                "SELECT 1 FROM effect_outbox WHERE queue_item_id=? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            if linked is not None:
+                raise RuntimeError(
+                    "linked outbox effects must be reconciled atomically through "
+                    "CognitiveScheduler.reconcile_effect"
+                )
             return self._reconcile_mark_with_conn(conn, item_id, status)
 
 
