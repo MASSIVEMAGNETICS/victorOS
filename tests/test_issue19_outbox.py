@@ -1328,22 +1328,20 @@ def test_record_intent_cannot_attach_queue_projection_after_claim(tmp_path, quar
     assert before["queue_item_id"] is None
 
 
-def test_record_intent_rejects_queue_projection_rebinding(tmp_path):
-    outbox = EffectOutbox(tmp_path / "intent-rebinding.db")
-    effect_id = stable_effect_id("memory.commit_reflection", "rebind")
+def test_record_intent_preserves_first_queue_projection_for_duplicate_candidates(tmp_path):
+    outbox = EffectOutbox(tmp_path / "duplicate-intent-link.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "duplicate-link")
     outbox.record_intent(
-        effect_id, "memory.commit_reflection", "rebind", "digest",
-        queue_item_id="queue-original",
+        effect_id, "memory.commit_reflection", "duplicate-link", "digest",
+        queue_item_id="queue-first",
     )
-    before = outbox.get(effect_id)
 
-    with pytest.raises(ValueError, match="already linked to queue item"):
-        outbox.record_intent(
-            effect_id, "memory.commit_reflection", "rebind", "digest",
-            queue_item_id="queue-replacement",
-        )
+    duplicate = outbox.record_intent(
+        effect_id, "memory.commit_reflection", "duplicate-link", "digest",
+        queue_item_id="queue-second",
+    )
 
-    assert outbox.get(effect_id) == before
+    assert duplicate["queue_item_id"] == "queue-first"
 
 
 @pytest.mark.parametrize(

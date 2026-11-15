@@ -203,40 +203,39 @@ class EffectOutbox:
             raise ValueError(
                 f"effect_id {effect_id} already recorded with a different payload digest; "
                 "refusing to dispatch")
-        if queue_item_id is not None:
+        if queue_item_id is not None and row["queue_item_id"] is None:
             queue_item_id = str(queue_item_id)
-            linked_queue_item_id = row["queue_item_id"]
-            if (linked_queue_item_id is not None
-                    and linked_queue_item_id != queue_item_id):
+            if row["status"] in ("CLAIMED", "UNKNOWN"):
                 raise ValueError(
-                    f"effect_id {effect_id} is already linked to queue item "
-                    f"{linked_queue_item_id}; refusing to relink to {queue_item_id}")
-            if linked_queue_item_id is None:
-                if row["status"] in ("CLAIMED", "UNKNOWN"):
-                    raise ValueError(
-                        f"effect_id {effect_id} cannot attach a queue projection "
-                        f"while status is {row['status']}")
-                changed = conn.execute("""
-                    UPDATE effect_outbox SET queue_item_id=?, updated_at=?
-                    WHERE effect_id=? AND queue_item_id IS NULL
-                      AND status NOT IN ('CLAIMED', 'UNKNOWN')
-                """, (queue_item_id, now, effect_id)).rowcount
-                if changed != 1:
-                    row = conn.execute(
-                        "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
-                    ).fetchone()
-                    if row is None:
-                        raise RuntimeError(
-                            f"effect outbox intent disappeared during link: {effect_id}"
-                        )
-                    if row["queue_item_id"] != queue_item_id:
+                    f"effect_id {effect_id} cannot attach a queue projection "
+                    f"while status is {row['status']}")
+            # One stable effect may be referenced by duplicate queue candidates.
+            # Preserve the first queue projection as canonical; later candidates
+            # are deduplicated by effect_id and must not rebind that projection.
+            changed = conn.execute("""
+                UPDATE effect_outbox SET queue_item_id=?, updated_at=?
+                WHERE effect_id=? AND queue_item_id IS NULL
+                  AND status NOT IN ('CLAIMED', 'UNKNOWN')
+            """, (queue_item_id, now, effect_id)).rowcount
+            if changed != 1:
+                row = conn.execute(
+                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"effect outbox intent disappeared during link: {effect_id}"
+                    )
+                if row["queue_item_id"] is None:
+                    if row["status"] in ("CLAIMED", "UNKNOWN"):
                         raise ValueError(
-                            f"effect_id {effect_id} was concurrently linked to "
-                            f"queue item {row['queue_item_id']}; refusing to relink")
-                else:
-                    row = conn.execute(
-                        "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
-                    ).fetchone()
+                            f"effect_id {effect_id} cannot attach a queue projection "
+                            f"while status is {row['status']}")
+                    raise RuntimeError(
+                        f"effect_id {effect_id} queue projection was not attached")
+            else:
+                row = conn.execute(
+                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+                ).fetchone()
         return EffectOutbox._row_dict(row)
 
     def record_intent(self, effect_id, capability, source_item_id, payload_digest,
