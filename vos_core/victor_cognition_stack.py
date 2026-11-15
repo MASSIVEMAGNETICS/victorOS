@@ -878,60 +878,72 @@ class VictorCognitionStack:
         return crystallized
 
     # ---------------------------------------------------------------- the wake
-    def cycle(self, text=None, source="manual", tick=None):
-        if tick is None:
-            self.tick += 1
-        else:
-            tick = int(tick)
-            if tick < self.tick:
-                raise ValueError("external tick cannot move cognition clock backward")
-            self.tick = tick
-        conn = self._conn()
-        self._persist_tick(conn)
-        report = {"tick": self.tick, "steps": {}}
+    def cycle(self, text=None, source="manual", tick=None, *, connection=None):
+        """Run one cognition cycle, optionally inside a caller-owned transaction."""
+        owns_connection = connection is None
+        conn = connection if connection is not None else self._conn()
+        previous_tick = self.tick
+        try:
+            if tick is None:
+                next_tick = self.tick + 1
+            else:
+                next_tick = int(tick)
+                if next_tick < self.tick:
+                    raise ValueError("external tick cannot move cognition clock backward")
+            self.tick = next_tick
+            self._persist_tick(conn)
+            report = {"tick": self.tick, "steps": {}}
 
-        if text:
-            memory_id, created, h16 = self._remember(
-                conn, "input", "note", None, text, source, None, None, {}
-            )
-            concept = f"focus:{h16}"
-            report["steps"]["sensory"] = {"memory_id": memory_id, "created": created}
-            self._publish(conn, "sensory", "sensory_input", concept, {"memory_id": memory_id})
-        else:
-            concept = f"tick:{self.tick}"
-            self._publish(conn, "wake", "tick_open", concept, {})
+            if text:
+                memory_id, created, h16 = self._remember(
+                    conn, "input", "note", None, text, source, None, None, {}
+                )
+                concept = f"focus:{h16}"
+                report["steps"]["sensory"] = {"memory_id": memory_id, "created": created}
+                self._publish(conn, "sensory", "sensory_input", concept, {"memory_id": memory_id})
+            else:
+                concept = f"tick:{self.tick}"
+                self._publish(conn, "wake", "tick_open", concept, {})
 
-        hits = len(set(_terms(text or concept)).intersection(HIGH_SIGNAL))
-        score = _clamp01(0.5 + 0.1 * hits)
-        self._publish(conn, "attention", "salience_detected", concept, {"score": score})
+            hits = len(set(_terms(text or concept)).intersection(HIGH_SIGNAL))
+            score = _clamp01(0.5 + 0.1 * hits)
+            self._publish(conn, "attention", "salience_detected", concept, {"score": score})
 
-        links = self.link_memories(conn)
-        self._publish(conn, "memory", "indexed_and_linked", concept, {"links": links})
+            links = self.link_memories(conn)
+            self._publish(conn, "memory", "indexed_and_linked", concept, {"links": links})
 
-        inference = self.apply_rules(conn)
-        self._publish(conn, "inference", "rules_applied", concept, inference)
+            inference = self.apply_rules(conn)
+            self._publish(conn, "inference", "rules_applied", concept, inference)
 
-        plans = self.update_plans(conn)
-        actions = self.propose_actions(conn)
-        self._publish(conn, "goal", "goals_planned", concept, {"plans": plans, "actions": actions})
+            plans = self.update_plans(conn)
+            actions = self.propose_actions(conn)
+            self._publish(conn, "goal", "goals_planned", concept, {"plans": plans, "actions": actions})
 
-        pending = conn.execute(
-            "SELECT COUNT(*) AS c FROM actions WHERE status='proposed'"
-        ).fetchone()["c"]
-        self._publish(conn, "executive", "gate_hold", concept, {"pending": pending})
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM actions WHERE status='proposed'"
+            ).fetchone()["c"]
+            self._publish(conn, "executive", "gate_hold", concept, {"pending": pending})
 
-        crystallized = self.check_emergence(conn)
+            crystallized = self.check_emergence(conn)
 
-        report["steps"]["attention"] = {"score": score}
-        report["steps"]["association"] = {"links": links}
-        report["steps"]["inference"] = inference
-        report["steps"]["planning"] = {"plans": plans, "actions": actions}
-        report["steps"]["executive"] = {"pending_actions": pending}
-        report["steps"]["membrane"] = {"crystallized": crystallized}
+            report["steps"]["attention"] = {"score": score}
+            report["steps"]["association"] = {"links": links}
+            report["steps"]["inference"] = inference
+            report["steps"]["planning"] = {"plans": plans, "actions": actions}
+            report["steps"]["executive"] = {"pending_actions": pending}
+            report["steps"]["membrane"] = {"crystallized": crystallized}
 
-        conn.commit()
-        conn.close()
-        return report
+            if owns_connection:
+                conn.commit()
+            return report
+        except BaseException:
+            if owns_connection and conn.in_transaction:
+                conn.rollback()
+            self.tick = previous_tick
+            raise
+        finally:
+            if owns_connection:
+                conn.close()
 
     # ----------------------------------------------------------- introspection
     def goals(self):
@@ -951,10 +963,14 @@ class VictorCognitionStack:
             out.append(d)
         return out
 
-    def actions(self):
-        conn = self._conn()
-        rows = conn.execute("SELECT * FROM actions ORDER BY id DESC").fetchall()
-        conn.close()
+    def actions(self, connection: Optional[sqlite3.Connection] = None):
+        owns_connection = connection is None
+        conn = connection if connection is not None else self._conn()
+        try:
+            rows = conn.execute("SELECT * FROM actions ORDER BY id DESC").fetchall()
+        finally:
+            if owns_connection:
+                conn.close()
         out = []
         for r in rows:
             d = dict(r)

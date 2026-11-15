@@ -551,7 +551,7 @@ def test_generic_mark_preserves_ordinary_cognition_and_unambiguous_actions(tmp_p
     assert rows["safe-action"] == ItemStatus.COMPLETED.value
 
 
-def test_stale_parent_claim_cannot_commit_followups_or_candidates(tmp_path):
+def test_stale_parent_claim_cannot_commit_cognition_or_followups(tmp_path):
     stack,phys,s=runtime(tmp_path)
     parent=CognitiveItem(
         id="stale-parent",kind=ItemKind.QUERY,content={"text":"stale parent"},
@@ -559,34 +559,30 @@ def test_stale_parent_claim_cannot_commit_followups_or_candidates(tmp_path):
     )
     assert s.queue.push(parent)
 
-    def lose_claim_during_reasoning(item,context):
-        old_generation=item.claim_generation
-        s.queue.recover_after_confirmed_shutdown(confirmed_terminated=True)
-        replacement=s.queue.claim_item(item.id,worker_id=s.worker_id)
+    def supersede_claim_during_context(item):
+        with s.queue._conn() as conn:
+            row=conn.execute(
+                "SELECT worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+                (item.id,),
+            ).fetchone()
+        token={"worker_id":row["worker_id"],
+               "claim_generation":int(row["claim_generation"])}
+        assert s.queue.mark_claimed(item.id,ItemStatus.PENDING,**token)
+        replacement=s.queue.claim_item(item.id,worker_id="replacement-worker")
         assert replacement is not None
-        assert replacement.claim_generation==old_generation+1
-        return {
-            "followup_thoughts":[{
-                "kind":ItemKind.THOUGHT,
-                "content":{"step":"must-not-persist","origin_item_id":item.id},
-                "priority":0.5,
-            }],
-            "candidate_actions":[{
-                "capability":"test.unregistered",
-                "payload":{"must_not_dispatch":True},
-                "score":0.9,
-                "source_item_id":item.id,
-                "source_depth":item.depth,
-            }],
-        }
+        assert replacement.claim_generation==token["claim_generation"]+1
+        return {"relevant_memories":[],"active_goals":[]}
 
-    with mock.patch.object(s,"_reason",side_effect=lose_claim_during_reasoning):
+    with mock.patch.object(s,"_retrieve_context",side_effect=supersede_claim_during_context):
         receipt=s.tick(max_items=1)
 
     assert receipt["generated_thoughts"]==0
     assert receipt["generated_actions"]==0
     assert receipt["execution"] is None
-    assert any("stale queue completion: stale-parent" in error
+    assert stack.tick==0
+    assert stack.search("stale parent",limit=8)==[]
+    assert stack.actions()==[]
+    assert any("cognitive claim is no longer owned" in error
                for error in receipt.get("errors",[]))
     with s._conn() as conn:
         row=conn.execute(
@@ -594,7 +590,7 @@ def test_stale_parent_claim_cannot_commit_followups_or_candidates(tmp_path):
             ("stale-parent",),
         ).fetchone()
         assert row["status"]==ItemStatus.PROCESSING.value
-        assert row["worker_id"]==s.worker_id
+        assert row["worker_id"]=="replacement-worker"
         assert row["claim_generation"]==2
         assert conn.execute(
             "SELECT COUNT(*) FROM cognitive_queue WHERE id<>?",
@@ -648,3 +644,43 @@ def test_followup_insert_failure_rolls_back_parent_completion_and_children(tmp_p
         assert conn.execute(
             "SELECT COUNT(*) FROM cognitive_queue WHERE id LIKE 'atomic-child-%'"
         ).fetchone()[0]==0
+
+
+def test_cognition_cycle_and_followup_insert_rollback_together(tmp_path):
+    stack,phys,s=runtime(tmp_path)
+    item_id=s.publish_query("atomic cognition rollback")
+
+    def fail_followup_insert(conn,item):
+        raise RuntimeError("simulated follow-up insert failure")
+
+    with mock.patch.object(s.queue,"_insert_with_conn",side_effect=fail_followup_insert):
+        receipt=s.tick(max_items=1)
+
+    assert stack.tick==0
+    assert stack.search("atomic cognition rollback",limit=8)==[]
+    assert stack.actions()==[]
+    assert any("simulated follow-up insert failure" in error
+               for error in receipt.get("errors",[]))
+    with s._conn() as conn:
+        parent=conn.execute(
+            "SELECT status FROM cognitive_queue WHERE id=?",(item_id,)
+        ).fetchone()
+        assert parent["status"]==ItemStatus.FAILED.value
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cognitive_queue WHERE parent_id=?",(item_id,)
+        ).fetchone()[0]==0
+
+
+def test_scheduler_requires_shared_sqlite_database_for_claim_fencing(tmp_path):
+    stack=VictorCognitionStack(str(tmp_path/"separate-stack.db"))
+    phys=VictorPhysiologyRuntime(
+        receipt_ledger=PhysiologyReceiptLedger(str(tmp_path/"separate-physiology.jsonl")),
+        granted_authorities=("local_owner",),
+    )
+    try:
+        CognitiveScheduler(stack,phys,tmp_path/"separate-queue.db")
+    except ValueError as exc:
+        assert "share one SQLite database" in str(exc)
+    else:
+        raise AssertionError("split stack/queue databases must fail closed")
+

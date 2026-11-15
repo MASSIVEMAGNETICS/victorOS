@@ -268,3 +268,27 @@ unmerged pending independent review and explicit founder approval.
 **Rollback:** Revert the three commits for this addendum on the draft branch.
 No production database migration or production state change is performed.
 
+## 2026-11-14: cognition persistence shares the queue claim transaction
+
+The earlier residual window in which `VictorCognitionStack.cycle()` could
+commit internal memories, plans, or proposed actions before the scheduler
+revalidated its queue claim is now closed for scheduler-driven cognition.
+
+- The scheduler requires the cognition stack and queue/outbox to use the same
+  SQLite database. Split database paths fail closed at construction.
+- Each claimed item is processed under one `BEGIN IMMEDIATE` transaction:
+  the exact worker/generation claim is checked first, the cognition cycle
+  writes through that same connection, and the parent claim plus follow-up
+  thoughts are committed before the transaction is released.
+- A superseded worker cannot persist the cognition cycle. A follow-up insert
+  or commit failure rolls back both cognition state and queue completion;
+  the in-memory stack tick is restored on rollback.
+- Standalone `VictorCognitionStack.cycle()` calls retain their existing
+  self-managed transaction behavior. The optional connection path is additive.
+
+This closes the scheduler-to-cognition claim window; it does not authenticate
+provider receipts, prove process termination, or establish exactly-once
+external effects. Provider reconciliation and founder approval gates remain
+unchanged. The longer writer transaction can increase SQLite write contention;
+lock timeouts remain fail-closed rather than bypassing the claim check.
+

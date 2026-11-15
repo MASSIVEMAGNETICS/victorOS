@@ -636,14 +636,30 @@ class PersistentCognitiveQueue:
                 raise RuntimeError("claimed cognitive item disappeared before token read")
         return self._row(row, ItemStatus.PROCESSING)
 
+    @staticmethod
+    def _owns_claim_with_conn(conn, item_id, *, worker_id, claim_generation) -> bool:
+        worker_id, claim_generation = PersistentCognitiveQueue._require_claim_token(
+            worker_id, claim_generation
+        )
+        row = conn.execute("""
+          SELECT 1 FROM cognitive_queue
+          WHERE id=? AND status=? AND worker_id=? AND claim_generation=?
+        """, (item_id, ItemStatus.PROCESSING.value, worker_id, claim_generation)).fetchone()
+        return row is not None
+
+    def assert_claim_owned_with_conn(self, conn, item_id, *, worker_id, claim_generation) -> None:
+        """Fail closed unless this exact worker generation still owns the row."""
+        if not self._owns_claim_with_conn(
+            conn, item_id, worker_id=worker_id, claim_generation=claim_generation
+        ):
+            raise PermissionError("cognitive claim is no longer owned by this worker generation")
+
     def owns_claim(self, item_id: str, *, worker_id, claim_generation) -> bool:
         worker_id, claim_generation = self._require_claim_token(worker_id, claim_generation)
         with self._conn() as conn:
-            row = conn.execute("""
-              SELECT 1 FROM cognitive_queue
-              WHERE id=? AND status=? AND worker_id=? AND claim_generation=?
-            """, (item_id, ItemStatus.PROCESSING.value, worker_id, claim_generation)).fetchone()
-        return row is not None
+            return self._owns_claim_with_conn(
+                conn, item_id, worker_id=worker_id, claim_generation=claim_generation
+            )
 
     def pop_budgeted(self,current_tick:int,max_items:int=8,max_ms:int=300,
                      worker_id:Optional[str]=None)->List[CognitiveItem]:
@@ -688,25 +704,28 @@ class PersistentCognitiveQueue:
                 conn,item_id,status,worker_id,claim_generation
             )
 
+    def complete_claim_with_followups_with_conn(self,conn,item_id:str,
+                                                followups:List[CognitiveItem],*,
+                                                worker_id,claim_generation)->Optional[int]:
+        """Complete a claim and publish follow-ups in the caller's transaction."""
+        if not self._transition_claim_with_conn(
+            conn,item_id,ItemStatus.COMPLETED,worker_id,claim_generation
+        ):
+            return None
+        inserted=0
+        for item in followups:
+            if self._insert_with_conn(conn,item):
+                inserted+=1
+        return inserted
+
     def complete_claim_with_followups(self,item_id:str,followups:List[CognitiveItem],*,
                                       worker_id,claim_generation)->Optional[int]:
-        """Complete one exact claim and insert its follow-up thoughts atomically.
-
-        Returns the number of inserted follow-ups, or None when the claim token
-        is stale. A stale worker cannot publish child thoughts or candidate
-        actions after losing ownership. Any insert error rolls back both the
-        child rows and the parent completion.
-        """
+        """Complete one exact claim and insert its follow-up thoughts atomically."""
         with self._conn() as conn:
-            if not self._transition_claim_with_conn(
-                conn,item_id,ItemStatus.COMPLETED,worker_id,claim_generation
-            ):
-                return None
-            inserted=0
-            for item in followups:
-                if self._insert_with_conn(conn,item):
-                    inserted+=1
-            return inserted
+            return self.complete_claim_with_followups_with_conn(
+                conn,item_id,followups,worker_id=worker_id,
+                claim_generation=claim_generation
+            )
 
     def mark(self,item_id:str,status:ItemStatus):
         """Compatibility state API that cannot mutate a live or ambiguous claim.
@@ -851,6 +870,10 @@ class CognitiveScheduler:
     """One persistent macrotick clock coordinating cognition without recursive think()."""
     def __init__(self,stack:VictorCognitionStack,physiology:VictorPhysiologyRuntime,db_path:str|Path):
         self.stack=stack; self.physiology=physiology; self.db_path=Path(db_path)
+        if Path(self.stack.db_path).resolve() != self.db_path.resolve():
+            raise ValueError(
+                "CognitiveScheduler requires the cognition stack and queue to share one SQLite database"
+            )
         # One durable identity is shared by cognitive-queue and outbox claims.
         self.worker_incarnation_id = uuid.uuid4().hex
         self.worker_id = f"scheduler-{self.worker_incarnation_id}"
@@ -911,13 +934,15 @@ class CognitiveScheduler:
           "active_goals":[g for g in self.stack.goals() if g.get("status")=="active"][:12],
         }
 
-    def _reason(self,item,context):
+    def _reason(self,item,context,*,connection=None):
         out={"followup_thoughts":[],"candidate_actions":[]}
         if item.kind in (ItemKind.QUERY,ItemKind.GOAL,ItemKind.CONFLICT,ItemKind.PREDICTION):
             text=str(item.content.get("text") or item.content.get("message") or _canonical_json(item.content))
-            before={a["id"] for a in self.stack.actions()}
-            report=self.stack.cycle(text,source="scheduler",tick=self.current_tick)
-            after=[a for a in self.stack.actions() if a["id"] not in before]
+            before={a["id"] for a in self.stack.actions(connection=connection)}
+            report=self.stack.cycle(
+                text,source="scheduler",tick=self.current_tick,connection=connection
+            )
+            after=[a for a in self.stack.actions(connection=connection) if a["id"] not in before]
             out["followup_thoughts"].append({
               "kind":ItemKind.THOUGHT,
               "content":{"step":"review_cognition_cycle","origin_item_id":item.id,"text":text,
@@ -949,7 +974,7 @@ class CognitiveScheduler:
             if item.content.get("step")=="review_action_observation":
                 return out
             action_ids=[int(x) for x in item.content.get("stack_action_ids",[])]
-            actions={a["id"]:a for a in self.stack.actions()}
+            actions={a["id"]:a for a in self.stack.actions(connection=connection)}
             for aid in action_ids:
                 action=actions.get(aid)
                 if action and action["status"]=="proposed":
@@ -1253,21 +1278,36 @@ class CognitiveScheduler:
                 receipt.setdefault("stale_claims",[]).append(item.id)
                 continue
             try:
-                reasoned=self._reason(item,self._retrieve_context(item))
-                followups=[]
-                for f in reasoned["followup_thoughts"]:
-                    followups.append(CognitiveItem(
-                      id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
-                      priority=max(0,min(1,float(f.get("priority",.5)))),depth=item.depth+1,
-                      parent_id=item.id,created_tick=self.current_tick))
-                inserted=self.queue.complete_claim_with_followups(
-                    item.id,followups,**claim_token
-                )
-                if inserted is None:
-                    receipt.setdefault("errors",[]).append(
-                        f"stale queue completion: {item.id}"
+                context=self._retrieve_context(item)
+                connection=self._conn()
+                previous_stack_tick=self.stack.tick
+                try:
+                    # Hold SQLite's writer lock from claim validation through
+                    # cognition persistence and parent/follow-up publication.
+                    connection.execute("BEGIN IMMEDIATE")
+                    self.queue.assert_claim_owned_with_conn(
+                        connection,item.id,**claim_token
                     )
-                    continue
+                    reasoned=self._reason(item,context,connection=connection)
+                    followups=[]
+                    for f in reasoned["followup_thoughts"]:
+                        followups.append(CognitiveItem(
+                          id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
+                          priority=max(0,min(1,float(f.get("priority",.5)))),depth=item.depth+1,
+                          parent_id=item.id,created_tick=self.current_tick))
+                    inserted=self.queue.complete_claim_with_followups_with_conn(
+                        connection,item.id,followups,**claim_token
+                    )
+                    if inserted is None:
+                        raise RuntimeError(f"stale queue completion: {item.id}")
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    self.stack.tick=previous_stack_tick
+                    raise
+                finally:
+                    connection.close()
                 receipt["generated_thoughts"]+=inserted
                 candidates.extend(reasoned["candidate_actions"])
                 receipt["generated_actions"]+=len(reasoned["candidate_actions"])
