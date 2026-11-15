@@ -1284,3 +1284,87 @@ def test_reconcile_effect_rolls_back_outbox_when_queue_projection_fails(
     assert outbox_row["result_json"] is None
     assert result_count == 0
     assert observation_count_after == observation_count_before
+
+
+def test_record_intent_can_attach_ready_standalone_effect_once(tmp_path):
+    outbox = EffectOutbox(tmp_path / "ready-intent-link.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "ready-link")
+
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "ready-link", "digest"
+    )
+    linked = outbox.record_intent(
+        effect_id, "memory.commit_reflection", "ready-link", "digest",
+        queue_item_id="queue-ready",
+    )
+    assert linked["queue_item_id"] == "queue-ready"
+    assert outbox.record_intent(
+        effect_id, "memory.commit_reflection", "ready-link", "digest",
+        queue_item_id="queue-ready",
+    )["queue_item_id"] == "queue-ready"
+
+
+@pytest.mark.parametrize("quarantine", [False, True])
+def test_record_intent_cannot_attach_queue_projection_after_claim(tmp_path, quarantine):
+    outbox = EffectOutbox(tmp_path / f"late-intent-link-{quarantine}.db")
+    effect_id = stable_effect_id(
+        "memory.commit_reflection", f"late-link-{quarantine}"
+    )
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", f"late-link-{quarantine}", "digest"
+    )
+    token = claim_args(outbox, effect_id, "worker-a")
+    if quarantine:
+        assert outbox.mark_unknown(effect_id, "ambiguous", **token)
+    before = outbox.get(effect_id)
+
+    with pytest.raises(ValueError, match="cannot attach a queue projection"):
+        outbox.record_intent(
+            effect_id, "memory.commit_reflection", f"late-link-{quarantine}",
+            "digest", queue_item_id="late-queue",
+        )
+
+    assert outbox.get(effect_id) == before
+    assert before["queue_item_id"] is None
+
+
+def test_record_intent_rejects_queue_projection_rebinding(tmp_path):
+    outbox = EffectOutbox(tmp_path / "intent-rebinding.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "rebind")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "rebind", "digest",
+        queue_item_id="queue-original",
+    )
+    before = outbox.get(effect_id)
+
+    with pytest.raises(ValueError, match="already linked to queue item"):
+        outbox.record_intent(
+            effect_id, "memory.commit_reflection", "rebind", "digest",
+            queue_item_id="queue-replacement",
+        )
+
+    assert outbox.get(effect_id) == before
+
+
+@pytest.mark.parametrize(
+    ("capability", "source_item_id"),
+    [
+        ("memory.other_capability", "identity-source"),
+        ("memory.commit_reflection", "different-source"),
+    ],
+)
+def test_record_intent_rejects_effect_identity_reuse(tmp_path, capability, source_item_id):
+    outbox = EffectOutbox(tmp_path / "intent-identity.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "identity-source")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "identity-source", "digest"
+    )
+    before = outbox.get(effect_id)
+
+    with pytest.raises(ValueError, match="different capability/source identity"):
+        outbox.record_intent(
+            effect_id, capability, source_item_id, "digest"
+        )
+
+    assert outbox.get(effect_id) == before
+
