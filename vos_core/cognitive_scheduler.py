@@ -361,9 +361,32 @@ class EffectOutbox:
         """, (_utcnow(),)).rowcount
         return int(changed)
 
-    def recover_claimed_to_unknown(self) -> int:
-        """Restart recovery: every in-flight claim is ambiguous after a crash."""
+    def recover_claimed_to_unknown(self, *, confirmed_terminated: bool = False) -> int:
+        """Recover standalone outbox claims only after confirmed worker termination.
+
+        Claims linked to cognitive_queue rows must use
+        PersistentCognitiveQueue.recover_after_confirmed_shutdown so both
+        projections change in one transaction. The boolean is an explicit
+        caller assertion, not independent proof; lease expiry is not proof.
+        """
+        if confirmed_terminated is not True:
+            raise PermissionError(
+                "recovery requires confirmed termination of all previous workers"
+            )
         with self._conn() as conn:
+            # Acquire the writer lock before checking links so a concurrent
+            # intent/claim cannot appear between the guard and quarantine.
+            conn.execute("BEGIN IMMEDIATE")
+            linked_claim = conn.execute("""
+                SELECT 1 FROM effect_outbox
+                WHERE status='CLAIMED' AND queue_item_id IS NOT NULL
+                LIMIT 1
+            """).fetchone()
+            if linked_claim is not None:
+                raise RuntimeError(
+                    "linked outbox claims must be recovered atomically through "
+                    "PersistentCognitiveQueue.recover_after_confirmed_shutdown"
+                )
             return self._recover_claimed_to_unknown_with_conn(conn)
 
     @staticmethod

@@ -584,6 +584,77 @@ def test_recovery_requires_explicit_termination_authority(tmp_path):
         queue.recover_after_confirmed_shutdown(confirmed_terminated=False)
 
 
+def test_outbox_recovery_requires_explicit_termination_authority(tmp_path):
+    outbox = EffectOutbox(tmp_path / "outbox-recovery-guard.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "outbox-recovery-guard")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "outbox-recovery-guard", "digest"
+    )
+    assert outbox.claim(effect_id, "worker-a")
+    before = outbox.get(effect_id)
+
+    with pytest.raises(PermissionError, match="confirmed termination"):
+        outbox.recover_claimed_to_unknown()
+    with pytest.raises(PermissionError, match="confirmed termination"):
+        outbox.recover_claimed_to_unknown(confirmed_terminated=False)
+
+    assert outbox.get(effect_id) == before
+
+
+def test_standalone_outbox_recovery_quarantines_only_after_confirmation(tmp_path):
+    outbox = EffectOutbox(tmp_path / "standalone-outbox-recovery.db")
+    effect_id = stable_effect_id("memory.commit_reflection", "standalone-recovery")
+    outbox.record_intent(
+        effect_id, "memory.commit_reflection", "standalone-recovery", "digest"
+    )
+    assert outbox.claim(effect_id, "terminated-worker")
+
+    assert outbox.recover_claimed_to_unknown(confirmed_terminated=True) == 1
+    recovered = outbox.get(effect_id)
+    assert recovered["status"] == "UNKNOWN"
+    assert recovered["worker_id"] is None
+
+
+def test_outbox_recovery_refuses_linked_claims_outside_queue_transaction(tmp_path):
+    path = tmp_path / "linked-outbox-recovery.db"
+    queue = PersistentCognitiveQueue(path)
+    item_id = "linked-outbox-recovery"
+    assert queue.push(CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    ))
+    queue_claim = queue.claim_item(item_id, worker_id="worker-a")
+    assert queue_claim is not None
+
+    effect_id = stable_effect_id("memory.commit_reflection", item_id)
+    queue.outbox.record_intent(
+        effect_id,
+        "memory.commit_reflection",
+        item_id,
+        "digest",
+        queue_item_id=item_id,
+    )
+    assert queue.outbox.claim(effect_id, "worker-a")
+
+    with pytest.raises(RuntimeError, match="recover_after_confirmed_shutdown"):
+        queue.outbox.recover_claimed_to_unknown(confirmed_terminated=True)
+
+    assert queue.outbox.get(effect_id)["status"] == "CLAIMED"
+    with queue._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone()
+    assert queue_row["status"] == ItemStatus.PROCESSING.value
+    assert queue_row["worker_id"] == queue_claim.worker_id
+    assert queue_row["claim_generation"] == queue_claim.claim_generation
+
+
 def test_explicit_recovery_quarantines_claims_and_requeues_cognition(tmp_path):
     path = tmp_path / "recovery-guard.db"
     first = PersistentCognitiveQueue(path)
