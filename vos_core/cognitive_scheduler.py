@@ -257,12 +257,29 @@ class EffectOutbox:
             raise ValueError("claim_generation must be a positive integer")
         return worker_id, claim_generation
 
-    def claim_with_token(self, effect_id, worker_id, lease_seconds: int = 30) -> Optional[Dict[str, Any]]:
-        """Atomically claim READY and return the durable owner/generation token.
+    @staticmethod
+    def _require_standalone_effect_with_conn(conn, effect_id, operation):
+        """Reject one-table mutations when an effect has a queue projection."""
+        row = conn.execute(
+            "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+        if row is not None and row["queue_item_id"] is not None:
+            raise RuntimeError(
+                "linked outbox effects must use CognitiveScheduler's atomic "
+                f"{operation} path"
+            )
+        return row
 
-        A generation advances on every successful claim, including a retry by
-        the same worker incarnation. The token must accompany every callback
-        that mutates this claim; a stale token changes zero rows.
+    def claim_with_token(
+        self, effect_id, worker_id, lease_seconds: int = 30,
+        *, queue_claim_generation: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim a standalone effect, or a linked effect under its queue claim.
+
+        Linked effects require the matching PROCESSING queue claim token. This
+        prevents a public outbox-only claim from splitting the two projections
+        or accepting a stale generation from the same worker incarnation.
         """
         if not isinstance(worker_id, str) or not worker_id:
             raise ValueError("worker_id is required")
@@ -270,6 +287,34 @@ class EffectOutbox:
         lease_until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(lease_seconds))).isoformat()
         now = _utcnow()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intent = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if intent is None:
+                return None
+            queue_item_id = intent["queue_item_id"]
+            if queue_item_id is not None:
+                if type(queue_claim_generation) is not int or queue_claim_generation < 1:
+                    raise ValueError(
+                        "queue_claim_generation is required for linked outbox claim"
+                    )
+                queue_claim = conn.execute(
+                    """SELECT status, worker_id, claim_generation
+                       FROM cognitive_queue WHERE id=?""",
+                    (queue_item_id,),
+                ).fetchone()
+                if (
+                    queue_claim is None
+                    or queue_claim["status"] != ItemStatus.PROCESSING.value
+                    or queue_claim["worker_id"] != worker_id
+                    or int(queue_claim["claim_generation"]) != queue_claim_generation
+                ):
+                    raise RuntimeError(
+                        "linked outbox claim requires the matching active "
+                        "cognitive-queue claim"
+                    )
             changed = conn.execute("""
               UPDATE effect_outbox
               SET status='CLAIMED', worker_id=?, lease_expires_at=?,
@@ -290,12 +335,15 @@ class EffectOutbox:
                 "claim_generation": int(row["claim_generation"]),
             }
 
-    def claim(self, effect_id, worker_id, lease_seconds: int = 30) -> bool:
-        """Compatibility predicate for callers that only need claim success.
-
-        Mutation callbacks must use claim_with_token() and retain its token.
-        """
-        return self.claim_with_token(effect_id, worker_id, lease_seconds) is not None
+    def claim(
+        self, effect_id, worker_id, lease_seconds: int = 30,
+        *, queue_claim_generation: Optional[int] = None,
+    ) -> bool:
+        """Compatibility predicate; linked effects require the queue claim token."""
+        return self.claim_with_token(
+            effect_id, worker_id, lease_seconds,
+            queue_claim_generation=queue_claim_generation,
+        ) is not None
 
     @staticmethod
     def _release_claim_with_conn(conn, effect_id, worker_id, claim_generation) -> bool:
@@ -313,6 +361,8 @@ class EffectOutbox:
     def release_claim(self, effect_id, *, worker_id=None, claim_generation=None) -> bool:
         """Release only the exact active claim that provably never dispatched."""
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "claim release")
             return self._release_claim_with_conn(
                 conn,effect_id,worker_id,claim_generation
             )
@@ -342,23 +392,38 @@ class EffectOutbox:
     def complete(self, effect_id, result, observation_event_id, *,
                  worker_id=None, claim_generation=None) -> bool:
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "completion")
             return self._complete_with_conn(
                 conn, effect_id, result, observation_event_id,
                 worker_id=worker_id, claim_generation=claim_generation)
 
+    @staticmethod
+    def _mark_unknown_with_conn(conn, effect_id, error=None, *,
+                                worker_id=None, claim_generation=None) -> bool:
+        """Quarantine the exact claim inside a caller-owned transaction."""
+        worker_id, claim_generation = EffectOutbox._require_claim_token(
+            worker_id, claim_generation
+        )
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
+            lease_expires_at=NULL, updated_at=?
+          WHERE effect_id=? AND status='CLAIMED'
+            AND worker_id=? AND claim_generation=?
+        """, (str(error)[:500] if error else None, _utcnow(),
+              effect_id, worker_id, claim_generation)).rowcount
+        return bool(changed)
+
     def mark_unknown(self, effect_id, error: Optional[str] = None, *,
                      worker_id=None, claim_generation=None) -> bool:
-        """Quarantine only the exact active claim that observed ambiguity."""
-        worker_id, claim_generation = self._require_claim_token(worker_id, claim_generation)
+        """Quarantine only a standalone effect's exact active claim."""
         with self._conn() as conn:
-            changed = conn.execute("""
-              UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
-                lease_expires_at=NULL, updated_at=?
-              WHERE effect_id=? AND status='CLAIMED'
-                AND worker_id=? AND claim_generation=?
-            """, (str(error)[:500] if error else None, _utcnow(),
-                  effect_id, worker_id, claim_generation)).rowcount
-        return bool(changed)
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "quarantine")
+            return self._mark_unknown_with_conn(
+                conn, effect_id, error,
+                worker_id=worker_id, claim_generation=claim_generation,
+            )
 
     def record_transient_failure(self, effect_id, error: Optional[str] = None, *,
                                  worker_id=None, claim_generation=None) -> Dict[str, Any]:
@@ -368,9 +433,15 @@ class EffectOutbox:
         to FAILED (dead-letter queue). Ambiguous failures must use mark_unknown.
         """
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
             if row is None:
                 raise KeyError(f"unknown effect_id: {effect_id}")
+            if row["queue_item_id"] is not None:
+                raise RuntimeError(
+                    "linked outbox effects must use CognitiveScheduler's atomic "
+                    "transient-failure path"
+                )
             worker_id, claim_generation = self._require_claim_token(
                 worker_id, claim_generation)
             attempts = int(row["attempts"])
@@ -1110,6 +1181,47 @@ class CognitiveScheduler:
         valid=[dict(c) for c in candidates if c.get("capability") and 0<=float(c.get("score",0))<=1]
         return sorted(valid,key=lambda c:(float(c.get("score",0)),str(c["capability"]),str(c.get("source_item_id",""))),reverse=True)
 
+    def _mark_linked_effect_unknown(
+        self, effect_id, error, *, queue_item_id,
+        outbox_claim_token, queue_claim_token,
+    ) -> bool:
+        """Quarantine a linked effect and its queue projection atomically."""
+        outbox_worker, outbox_generation = self.outbox._require_claim_token(
+            outbox_claim_token.get("worker_id"),
+            outbox_claim_token.get("claim_generation"),
+        )
+        queue_worker, queue_generation = self.queue._require_claim_token(
+            queue_claim_token.get("worker_id"),
+            queue_claim_token.get("claim_generation"),
+        )
+        if outbox_worker != queue_worker:
+            raise ValueError("linked outbox and queue claims must share a worker identity")
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            if row["queue_item_id"] != queue_item_id:
+                raise RuntimeError("effect is not linked to the selected queue item")
+            if not EffectOutbox._mark_unknown_with_conn(
+                conn, effect_id, error,
+                worker_id=outbox_worker,
+                claim_generation=outbox_generation,
+            ):
+                return False
+            if not self.queue._transition_claim_with_conn(
+                conn, queue_item_id, ItemStatus.UNKNOWN,
+                queue_worker, queue_generation,
+            ):
+                raise RuntimeError(
+                    "queue claim changed before ambiguous failure quarantine; "
+                    "rolling back outbox quarantine"
+                )
+        return True
+
     def _execute(self,ranked,queue_item_id=None,queue_claim_token=None):
         if not ranked: return {"executed":None,"status":"NO_ACTION"}
         if queue_item_id is not None:
@@ -1150,7 +1262,10 @@ class CognitiveScheduler:
         # 3. Concurrency-safe claim: exactly one worker may dispatch.
         worker_id=self.worker_id
         claim_token=self.outbox.claim_with_token(
-            effect_id,worker_id,lease_seconds=self.outbox_lease_seconds)
+            effect_id,worker_id,lease_seconds=self.outbox_lease_seconds,
+            queue_claim_generation=(
+                queue_claim_token["claim_generation"] if queue_item_id is not None else None
+            ))
         if claim_token is None:
             return {"executed":None,"status":"BLOCKED_CLAIMED","capability":capability,
                     "effect_id":effect_id}
@@ -1176,10 +1291,20 @@ class CognitiveScheduler:
             outcome=d.actual_outcome or {}
             error_type=str(outcome.get("error_type",""))
             if error_type in _AMBIGUOUS_ERROR_TYPES:
-                if not self.outbox.mark_unknown(
-                    effect_id,
-                    f"ambiguous provider failure: {error_type}: {outcome.get('error','')}",
-                    worker_id=worker_id,claim_generation=claim_generation):
+                error = f"ambiguous provider failure: {error_type}: {outcome.get('error','')}"
+                if queue_item_id is not None:
+                    marked = self._mark_linked_effect_unknown(
+                        effect_id, error,
+                        queue_item_id=queue_item_id,
+                        outbox_claim_token=claim_token,
+                        queue_claim_token=queue_claim_token,
+                    )
+                else:
+                    marked = self.outbox.mark_unknown(
+                        effect_id, error,
+                        worker_id=worker_id,claim_generation=claim_generation,
+                    )
+                if not marked:
                     raise RuntimeError("outbox claim changed before ambiguous failure quarantine")
                 raise RuntimeError(
                     f"ambiguous provider failure for effect {effect_id} "
