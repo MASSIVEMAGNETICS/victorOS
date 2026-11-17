@@ -1257,6 +1257,70 @@ def test_public_outbox_mutators_reject_linked_effects(tmp_path, operation):
     assert queue_claim.status is ItemStatus.PROCESSING
 
 
+def test_duplicate_queue_projection_is_completed_without_dispatch(tmp_path):
+    """Only the first queue row linked to a stable effect may own its dispatch."""
+    _, _, scheduler = runtime(tmp_path)
+    calls = counting_registry(scheduler)
+    cand = candidate(source="duplicate-projection-source")
+    effect_id = effect_id_for_candidate(cand)
+    from vos_core.cognitive_scheduler import _payload_digest
+
+    canonical = CognitiveItem(
+        id="canonical-action-projection",
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": cand},
+        priority=0.9,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push_with_effect_intent(
+        canonical,
+        effect_id,
+        cand["capability"],
+        cand["source_item_id"],
+        _payload_digest(cand["payload"]),
+    )
+    duplicate = CognitiveItem(
+        id="duplicate-action-projection",
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": cand},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(duplicate)
+    duplicate_claim = scheduler.queue.claim_item(
+        duplicate.id, worker_id=scheduler.worker_id
+    )
+    assert duplicate_claim is not None
+
+    result = scheduler._execute(
+        [cand],
+        queue_item_id=duplicate.id,
+        queue_claim_token={
+            "worker_id": duplicate_claim.worker_id,
+            "claim_generation": duplicate_claim.claim_generation,
+        },
+    )
+
+    assert result["status"] == "DEDUPED_DUPLICATE_QUEUE_PROJECTION"
+    assert result["canonical_queue_item_id"] == canonical.id
+    assert scheduler.outbox.get(effect_id)["status"] == "READY"
+    with scheduler._conn() as conn:
+        statuses = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id,status FROM cognitive_queue WHERE id IN (?,?)",
+                (canonical.id, duplicate.id),
+            ).fetchall()
+        }
+    assert statuses[canonical.id] == ItemStatus.PENDING.value
+    assert statuses[duplicate.id] == ItemStatus.COMPLETED.value
+    assert calls == []
+
+
 def test_linked_outbox_claim_requires_matching_queue_generation(tmp_path):
     """A linked outbox claim must be subordinate to the current queue claim."""
     _, _, scheduler = runtime(tmp_path)
