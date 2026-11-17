@@ -313,3 +313,26 @@ against a linked UNKNOWN effect and verifies that both records remain unchanged.
 Existing unlinked recovery tests remain in place. No schema migration,
 dependency, provider-trust claim, model-authority change, deployment, or
 approval-gate change is introduced.
+
+## 2026-11-16: linked outbox transition boundaries and persisted action projection reuse
+
+This follow-up closes public one-table mutation paths for linked queue/outbox effects and fixes a persisted-action requeue defect found while exercising the new claim fence.
+
+- `EffectOutbox.claim_with_token()` and its `claim()` compatibility wrapper now require the matching active cognitive-queue worker ID and claim generation whenever an effect has a `queue_item_id`. Standalone outbox effects retain their existing call shape.
+- Public `release_claim()`, `complete()`, `mark_unknown()`, and `record_transient_failure()` now reject linked effects. The scheduler continues to use connection-scoped transition helpers inside its existing queue/outbox transaction.
+- An ambiguous linked provider failure now changes the outbox row and its action-queue projection to `UNKNOWN` under one `BEGIN IMMEDIATE` transaction. If the queue fencing token is stale, the outbox quarantine rolls back with it.
+- `tick()` now recognizes a persisted `ACTION_CANDIDATE` as an already-durable queue projection. It reuses that row's claim token instead of completing the row and inserting a second queue row for the same stable effect. Duplicate projections are completed without dispatch; the first queue projection remains canonical. Unselected preclaimed candidates are returned to `PENDING` without changing their outbox intent.
+- Regression tests cover missing/stale queue generations, all four public outbox-only mutators, atomic quarantine rollback, duplicate projection deduplication, and continued scheduler/runtime behavior.
+
+**Verification:** Exact code-and-test head `c8e211f29699ee9de654d3340033c901af171a05` passed [Python Core Tests run #43986732080](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43986732080):
+- Python 3.10: **188 passed**
+- Python 3.11: **188 passed**
+- Python 3.12: **188 passed, 108 warnings**
+
+The Python 3.12 warnings are existing deprecations in other runtime modules. GitHub also reports the existing Node.js 20 action deprecation warning for `actions/checkout@v4` and `actions/setup-python@v5`; this follow-up did not change CI actions or suppress warnings.
+
+**Scope and limits:** No schema migration, provider integration, credential change, deployment, model-authority change, EUSS change, or approval-gate change. Provider receipt authenticity remains an external approval requirement. This is local SQLite queue/outbox consistency, not a claim of distributed exactly-once execution when a provider does not honor idempotency keys. The existing `confirmed_terminated=True` recovery argument remains an operator assertion, not independent proof of process termination.
+
+**Rollback:** Revert the follow-up code, test, and documentation commits on this draft branch. No production database or external provider state was changed.
+
+**Approval:** PR #22 remains draft and unmerged. Require independent review of all linked transition paths and explicit founder approval before merge or deployment.
