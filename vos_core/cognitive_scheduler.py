@@ -1260,7 +1260,12 @@ class CognitiveScheduler:
             return {"executed":None,"status":"BLOCKED_DLQ","capability":capability,
                     "effect_id":effect_id}
         # 3. Concurrency-safe claim: exactly one worker may dispatch.
-        worker_id=self.worker_id
+        # A linked effect is claimed under the exact queue owner token, not
+        # a separately inferred scheduler identity. Standalone effects retain
+        # the scheduler's own worker identity.
+        worker_id=(
+            queue_claim_token["worker_id"] if queue_item_id is not None else self.worker_id
+        )
         claim_token=self.outbox.claim_with_token(
             effect_id,worker_id,lease_seconds=self.outbox_lease_seconds,
             queue_claim_generation=(
