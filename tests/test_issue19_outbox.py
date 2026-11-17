@@ -93,11 +93,45 @@ def counting_registry(scheduler):
     scheduler.registry.execute = counting
     return calls
 
-def claim_args(outbox, effect_id, worker_id, lease_seconds=30):
-    """Acquire and return the exact fencing token required by callbacks."""
-    token = outbox.claim_with_token(effect_id, worker_id, lease_seconds=lease_seconds)
+def claim_args(outbox, effect_id, worker_id, lease_seconds=30, queue_claim_generation=None):
+    """Acquire the exact outbox token, optionally bound to a queue claim."""
+    token = outbox.claim_with_token(
+        effect_id, worker_id, lease_seconds=lease_seconds,
+        queue_claim_generation=queue_claim_generation,
+    )
     assert token is not None
     return token
+
+
+def _prepare_claimed_linked_effect(scheduler, item_id, worker_id="linked-worker"):
+    """Create a PROCESSING action projection and its matching CLAIMED outbox row."""
+    item = CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(item)
+    queue_claim = scheduler.queue.claim_item(item_id, worker_id=worker_id)
+    assert queue_claim is not None
+    effect_id = stable_effect_id("memory.commit_reflection", item_id)
+    scheduler.outbox.record_intent(
+        effect_id,
+        "memory.commit_reflection",
+        item_id,
+        "linked-test-digest",
+        queue_item_id=item_id,
+    )
+    outbox_claim = claim_args(
+        scheduler.outbox,
+        effect_id,
+        worker_id,
+        queue_claim_generation=queue_claim.claim_generation,
+    )
+    return effect_id, queue_claim, outbox_claim
 
 
 def test_stable_effect_id_and_payload_digest_conflict(tmp_path):
@@ -639,7 +673,10 @@ def test_outbox_recovery_refuses_linked_claims_outside_queue_transaction(tmp_pat
         "digest",
         queue_item_id=item_id,
     )
-    assert queue.outbox.claim(effect_id, "worker-a")
+    assert queue.outbox.claim(
+        effect_id, "worker-a",
+        queue_claim_generation=queue_claim.claim_generation,
+    )
 
     with pytest.raises(RuntimeError, match="recover_after_confirmed_shutdown"):
         queue.outbox.recover_claimed_to_unknown(confirmed_terminated=True)
@@ -1138,7 +1175,75 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
 
 
 def _prepare_unknown_queue_effect(scheduler, item_id):
-    """Create a linked UNKNOWN action/outbox pair for reconciliation tests."""
+    """Create a linked UNKNOWN action/outbox pair through the atomic path."""
+    effect_id, queue_claim, outbox_claim = _prepare_claimed_linked_effect(
+        scheduler, item_id, worker_id="reconcile-worker"
+    )
+    assert scheduler._mark_linked_effect_unknown(
+        effect_id,
+        "ambiguous test outcome",
+        queue_item_id=item_id,
+        outbox_claim_token=outbox_claim,
+        queue_claim_token={
+            "worker_id": queue_claim.worker_id,
+            "claim_generation": queue_claim.claim_generation,
+        },
+    )
+    return effect_id
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["release_claim", "complete", "mark_unknown", "record_transient_failure"],
+)
+def test_public_outbox_mutators_reject_linked_effects(tmp_path, operation):
+    """One-table outbox callbacks cannot split a linked queue projection."""
+    _, _, scheduler = runtime(tmp_path)
+    item_id = f"linked-mutator-{operation}"
+    effect_id, queue_claim, outbox_claim = _prepare_claimed_linked_effect(
+        scheduler, item_id
+    )
+    before_outbox = scheduler.outbox.get(effect_id)
+    with scheduler._conn() as conn:
+        before_queue = dict(conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone())
+
+    with pytest.raises(
+        RuntimeError,
+        match="linked outbox effects must use CognitiveScheduler's atomic",
+    ):
+        if operation == "release_claim":
+            scheduler.outbox.release_claim(effect_id, **outbox_claim)
+        elif operation == "complete":
+            scheduler.outbox.complete(
+                effect_id, {"ok": True}, "linked-mutator-observation",
+                **outbox_claim,
+            )
+        elif operation == "mark_unknown":
+            scheduler.outbox.mark_unknown(
+                effect_id, "linked direct quarantine", **outbox_claim
+            )
+        else:
+            scheduler.outbox.record_transient_failure(
+                effect_id, "linked direct transient failure", **outbox_claim
+            )
+
+    assert scheduler.outbox.get(effect_id) == before_outbox
+    with scheduler._conn() as conn:
+        after_queue = dict(conn.execute(
+            "SELECT status,worker_id,claim_generation FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone())
+    assert after_queue == before_queue
+    assert queue_claim.status is ItemStatus.PROCESSING
+
+
+def test_linked_outbox_claim_requires_matching_queue_generation(tmp_path):
+    """A linked outbox claim must be subordinate to the current queue claim."""
+    _, _, scheduler = runtime(tmp_path)
+    item_id = "linked-claim-generation"
     item = CognitiveItem(
         id=item_id,
         kind=ItemKind.ACTION_CANDIDATE,
@@ -1149,25 +1254,125 @@ def _prepare_unknown_queue_effect(scheduler, item_id):
         created_tick=0,
     )
     assert scheduler.queue.push(item)
-    queue_claim = scheduler.queue.claim_item(item_id, worker_id="reconcile-worker")
-    assert queue_claim is not None
-    assert scheduler.queue.mark_claimed(
-        item_id,
-        ItemStatus.UNKNOWN,
-        worker_id=queue_claim.worker_id,
-        claim_generation=queue_claim.claim_generation,
-    )
     effect_id = stable_effect_id("memory.commit_reflection", item_id)
     scheduler.outbox.record_intent(
-        effect_id,
-        "memory.commit_reflection",
-        item_id,
-        "reconciliation-test-digest",
+        effect_id, "memory.commit_reflection", item_id, "linked-claim-digest",
         queue_item_id=item_id,
     )
-    effect_claim = claim_args(scheduler.outbox, effect_id, "reconcile-worker")
-    assert scheduler.outbox.mark_unknown(effect_id, "ambiguous test outcome", **effect_claim)
-    return effect_id
+
+    with pytest.raises(ValueError, match="queue_claim_generation is required"):
+        scheduler.outbox.claim_with_token(effect_id, "worker-a")
+
+    queue_claim = scheduler.queue.claim_item(item_id, worker_id="worker-a")
+    assert queue_claim is not None
+    with pytest.raises(RuntimeError, match="matching active cognitive-queue claim"):
+        scheduler.outbox.claim_with_token(
+            effect_id, "worker-a",
+            queue_claim_generation=queue_claim.claim_generation + 1,
+        )
+
+    token = scheduler.outbox.claim_with_token(
+        effect_id, "worker-a",
+        queue_claim_generation=queue_claim.claim_generation,
+    )
+    assert token == {"worker_id": "worker-a", "claim_generation": 1}
+
+
+def test_linked_ambiguous_failure_quarantines_both_projections_atomically(tmp_path):
+    """An ambiguous linked provider outcome moves queue and outbox together."""
+    _, _, scheduler = runtime(tmp_path)
+    item_id = "linked-timeout-atomic"
+    item = CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(item)
+    queue_claim = scheduler.queue.claim_item(
+        item_id, worker_id=scheduler.worker_id
+    )
+    assert queue_claim is not None
+
+    def timeout_provider(capability, payload, idempotency_key=None):
+        raise TimeoutError("provider did not answer")
+
+    scheduler.registry.execute = timeout_provider
+    with pytest.raises(RuntimeError, match="ambiguous provider failure"):
+        scheduler._execute(
+            [candidate(source=item_id)],
+            queue_item_id=item_id,
+            queue_claim_token={
+                "worker_id": queue_claim.worker_id,
+                "claim_generation": queue_claim.claim_generation,
+            },
+        )
+
+    outbox_row = scheduler.outbox.get(stable_effect_id(
+        "memory.commit_reflection", item_id
+    ))
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status,worker_id FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone()
+    assert outbox_row["status"] == "UNKNOWN"
+    assert outbox_row["worker_id"] is None
+    assert queue_row["status"] == ItemStatus.UNKNOWN.value
+    assert queue_row["worker_id"] is None
+    assert scheduler.queue.unknown_count() == 1
+
+
+def test_linked_ambiguous_quarantine_rolls_back_if_queue_claim_is_stale(tmp_path):
+    """A failed queue fence rolls back the preceding outbox quarantine."""
+    _, _, scheduler = runtime(tmp_path)
+    item_id = "linked-timeout-stale-queue"
+    item = CognitiveItem(
+        id=item_id,
+        kind=ItemKind.ACTION_CANDIDATE,
+        content={"candidate": candidate(source=item_id)},
+        priority=0.8,
+        depth=1,
+        parent_id="source",
+        created_tick=0,
+    )
+    assert scheduler.queue.push(item)
+    queue_claim = scheduler.queue.claim_item(
+        item_id, worker_id=scheduler.worker_id
+    )
+    assert queue_claim is not None
+
+    def timeout_provider(capability, payload, idempotency_key=None):
+        raise TimeoutError("provider did not answer")
+
+    scheduler.registry.execute = timeout_provider
+    original_transition = scheduler.queue._transition_claim_with_conn
+    scheduler.queue._transition_claim_with_conn = lambda *args, **kwargs: False
+    try:
+        with pytest.raises(RuntimeError, match="rolling back outbox quarantine"):
+            scheduler._execute(
+                [candidate(source=item_id)],
+                queue_item_id=item_id,
+                queue_claim_token={
+                    "worker_id": queue_claim.worker_id,
+                    "claim_generation": queue_claim.claim_generation,
+                },
+            )
+    finally:
+        scheduler.queue._transition_claim_with_conn = original_transition
+
+    effect_id = stable_effect_id("memory.commit_reflection", item_id)
+    assert scheduler.outbox.get(effect_id)["status"] == "CLAIMED"
+    with scheduler._conn() as conn:
+        queue_row = conn.execute(
+            "SELECT status,worker_id FROM cognitive_queue WHERE id=?",
+            (item_id,),
+        ).fetchone()
+    assert queue_row["status"] == ItemStatus.PROCESSING.value
+    assert queue_row["worker_id"] == queue_claim.worker_id
 
 
 @pytest.mark.parametrize("outcome", ["executed", "not_executed"])
