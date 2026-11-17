@@ -1123,7 +1123,10 @@ def test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox(tmp_path)
         "atomic-recovery-digest",
         queue_item_id=item_id,
     )
-    effect_claim = claim_args(scheduler.outbox, effect_id, "worker-a")
+    effect_claim = claim_args(
+        scheduler.outbox, effect_id, "worker-a",
+        queue_claim_generation=queue_claim.claim_generation,
+    )
 
     def fail_outbox_recovery(conn):
         raise RuntimeError("simulated outbox quarantine failure")
@@ -1336,7 +1339,9 @@ def test_linked_ambiguous_failure_quarantines_both_projections_atomically(tmp_pa
     assert outbox_row["status"] == "UNKNOWN"
     assert outbox_row["worker_id"] is None
     assert queue_row["status"] == ItemStatus.UNKNOWN.value
-    assert queue_row["worker_id"] is None
+    # The last owner remains as provenance; UNKNOWN means the claim is no
+    # longer active even though the worker identity is retained.
+    assert queue_row["worker_id"] == queue_claim.worker_id
     assert scheduler.queue.unknown_count() == 1
 
 
