@@ -1582,13 +1582,94 @@ class CognitiveScheduler:
         work=self.queue.pop_budgeted(
             self.current_tick,max_items,max_ms,worker_id=self.worker_id
         )
-        receipt["processed"]=len(work); candidates=[]
+        receipt["processed"]=len(work)
+        candidates=[]
+        preclaimed_actions={}
         for item in work:
             claim_token={"worker_id":item.worker_id,
                          "claim_generation":item.claim_generation}
             if not self.queue.owns_claim(item.id,**claim_token):
                 receipt.setdefault("stale_claims",[]).append(item.id)
                 continue
+
+            # Persisted ACTION_CANDIDATE rows are already durable queue
+            # projections. Reuse their current claim and outbox link instead
+            # of completing the row and creating a second projection for the
+            # same stable effect ID.
+            if item.kind is ItemKind.ACTION_CANDIDATE:
+                candidate=item.content.get("candidate")
+                if not isinstance(candidate,dict) or not candidate.get("capability"):
+                    if not self.queue.mark_claimed(
+                        item.id,ItemStatus.FAILED,**claim_token
+                    ):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale malformed action transition: {item.id}"
+                        )
+                    receipt.setdefault("errors",[]).append(
+                        f"invalid persisted action candidate: {item.id}"
+                    )
+                    continue
+                effect_id=effect_id_for_candidate(candidate)
+                try:
+                    intent=self.outbox.record_intent(
+                        effect_id,str(candidate["capability"]),
+                        candidate.get("source_item_id"),
+                        _payload_digest(candidate.get("payload",{})),
+                        queue_item_id=item.id,
+                    )
+                except ValueError as exc:
+                    existing=self.outbox.get(effect_id)
+                    target=(
+                        ItemStatus.UNKNOWN
+                        if existing and existing.get("status") in ("CLAIMED","UNKNOWN")
+                        else ItemStatus.FAILED
+                    )
+                    if not self.queue.mark_claimed(item.id,target,**claim_token):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale action intent conflict transition: {item.id}"
+                        )
+                    receipt.setdefault("errors",[]).append(
+                        f"effect intent conflict: {exc}"
+                    )
+                    continue
+                canonical_queue_item_id=intent.get("queue_item_id")
+                if canonical_queue_item_id!=item.id:
+                    try:
+                        with self._conn() as conn:
+                            conn.execute("BEGIN IMMEDIATE")
+                            canonical=conn.execute(
+                                "SELECT kind FROM cognitive_queue WHERE id=?",
+                                (canonical_queue_item_id,),
+                            ).fetchone()
+                            if (
+                                canonical is None
+                                or canonical["kind"]!=ItemKind.ACTION_CANDIDATE.value
+                            ):
+                                raise RuntimeError(
+                                    "canonical action queue projection is missing or invalid"
+                                )
+                            if not self.queue._transition_claim_with_conn(
+                                conn,item.id,ItemStatus.COMPLETED,
+                                claim_token["worker_id"],claim_token["claim_generation"]
+                            ):
+                                raise RuntimeError(
+                                    "duplicate queue claim changed before deduplication"
+                                )
+                    except Exception as exc:
+                        if not self.queue.mark_claimed(
+                            item.id,ItemStatus.UNKNOWN,**claim_token
+                        ):
+                            receipt.setdefault("errors",[]).append(
+                                f"stale duplicate action transition: {item.id}"
+                            )
+                        receipt.setdefault("errors",[]).append(
+                            f"duplicate action projection blocked: {exc}"
+                        )
+                    continue
+                preclaimed_actions[effect_id]=(item,dict(candidate),claim_token)
+                candidates.append(dict(candidate))
+                continue
+
             try:
                 context=self._retrieve_context(item)
                 connection=self._conn()
@@ -1631,15 +1712,28 @@ class CognitiveScheduler:
                         f"stale queue failure transition: {item.id}"
                     )
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
+
         ranked=self._choice_rank(candidates)
-        selected_action_id=None
-        selected_action_token=None
-        # Persist each candidate together with its outbox intent in one
-        # atomic transaction. A payload-digest conflict for a stable effect
-        # ID is fail-closed: the candidate is never dispatched.
         durable_ranked=[]
+        seen_effect_ids=set()
         for candidate in ranked:
             effect_id=effect_id_for_candidate(candidate)
+            if effect_id in seen_effect_ids:
+                continue
+            if effect_id in preclaimed_actions:
+                durable_ranked.append(preclaimed_actions[effect_id])
+                seen_effect_ids.add(effect_id)
+                continue
+
+            # A stable effect already linked to another queue row is not
+            # copied into a new row. Its canonical projection remains the
+            # only item allowed to claim or reconcile the effect.
+            existing=self.outbox.get(effect_id)
+            if existing and existing.get("queue_item_id") is not None:
+                receipt["deferred_actions"]+=1
+                seen_effect_ids.add(effect_id)
+                continue
+
             durable_action=CognitiveItem(
               id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
               content={"candidate":candidate},priority=float(candidate.get("score",0.5)),
@@ -1654,34 +1748,53 @@ class CognitiveScheduler:
                 continue
             if not pushed:
                 raise RuntimeError("failed to persist action candidate")
-            durable_ranked.append((durable_action,candidate))
-        ranked=[candidate for _,candidate in durable_ranked]
-        for index,(durable_action,candidate) in enumerate(durable_ranked):
+            durable_ranked.append((durable_action,candidate,None))
+            seen_effect_ids.add(effect_id)
+
+        selected_action_id=None
+        selected_action_token=None
+        selected_candidate=None
+        for index,(durable_action,candidate,existing_token) in enumerate(durable_ranked):
             if index==0:
-                claimed_action=self.queue.claim_item(
-                    durable_action.id,worker_id=self.worker_id
-                )
-                if claimed_action is None:
-                    receipt["execution"]={
-                        "executed":None,"status":"BLOCKED_QUEUE_CLAIM",
-                        "queue_item_id":durable_action.id
-                    }
-                    receipt["execution_blocked"]="BLOCKED_QUEUE_CLAIM"
-                else:
-                    selected_action_id=durable_action.id
+                if existing_token is None:
+                    claimed_action=self.queue.claim_item(
+                        durable_action.id,worker_id=self.worker_id
+                    )
+                    if claimed_action is None:
+                        receipt["execution"]={
+                            "executed":None,"status":"BLOCKED_QUEUE_CLAIM",
+                            "queue_item_id":durable_action.id
+                        }
+                        receipt["execution_blocked"]="BLOCKED_QUEUE_CLAIM"
+                        continue
                     selected_action_token={
                         "worker_id":claimed_action.worker_id,
                         "claim_generation":claimed_action.claim_generation
                     }
+                else:
+                    selected_action_token=existing_token
+                selected_action_id=durable_action.id
+                selected_candidate=candidate
             else:
+                if existing_token is not None:
+                    with self._conn() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        if not self.queue._transition_claim_with_conn(
+                            conn,durable_action.id,ItemStatus.PENDING,
+                            existing_token["worker_id"],
+                            existing_token["claim_generation"],
+                        ):
+                            receipt.setdefault("errors",[]).append(
+                                f"stale deferred action claim: {durable_action.id}"
+                            )
                 receipt["deferred_actions"]+=1
-        # The queue item token and outbox token are separate fences. The
-        # selected queue item is completed in the same SQLite transaction as
-        # its capability result, observation, and outbox completion/release.
+
+        # Only the selected durable action is dispatched. Unselected persisted
+        # action rows return to PENDING with their outbox intent still READY.
         if selected_action_id is not None:
             try:
                 receipt["execution"]=self._execute(
-                    ranked,queue_item_id=selected_action_id,
+                    [selected_candidate],queue_item_id=selected_action_id,
                     queue_claim_token=selected_action_token
                 )
             except BaseException:
