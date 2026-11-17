@@ -1241,6 +1241,39 @@ class CognitiveScheduler:
         intent=self.outbox.record_intent(
             effect_id,capability,c.get("source_item_id"),digest,
             queue_item_id=queue_item_id)
+        # A stable effect may already belong to an earlier queue candidate.
+        # That first projection remains canonical; a duplicate candidate must
+        # be completed without attempting to claim or dispatch the effect.
+        canonical_queue_item_id = intent.get("queue_item_id")
+        if queue_item_id is not None and canonical_queue_item_id != queue_item_id:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                canonical = conn.execute(
+                    "SELECT kind FROM cognitive_queue WHERE id=?",
+                    (canonical_queue_item_id,),
+                ).fetchone()
+                if (
+                    canonical is None
+                    or canonical["kind"] != ItemKind.ACTION_CANDIDATE.value
+                ):
+                    raise RuntimeError(
+                        "canonical action queue projection is missing or invalid; "
+                        "refusing duplicate effect dispatch"
+                    )
+                if not self.queue._transition_claim_with_conn(
+                    conn, queue_item_id, ItemStatus.COMPLETED,
+                    queue_claim_token["worker_id"],
+                    queue_claim_token["claim_generation"],
+                ):
+                    raise RuntimeError(
+                        "duplicate queue claim changed before deduplication"
+                    )
+            return {
+                "executed": None,
+                "status": "DEDUPED_DUPLICATE_QUEUE_PROJECTION",
+                "effect_id": effect_id,
+                "canonical_queue_item_id": canonical_queue_item_id,
+            }
         # 2. Dedupe: an already-completed effect returns its stored outcome
         # without touching the provider again.
         if intent["status"]=="COMPLETED" and intent.get("result_json"):
