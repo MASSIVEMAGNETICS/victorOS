@@ -1014,15 +1014,29 @@ def test_completed_outbox_reconciliation_repairs_unknown_queue_projection(tmp_pa
         effect_id, "memory.commit_reflection", "completed-queue-repair",
         "digest", queue_item_id="completed-queue-repair"
     )
-    token = claim_args(scheduler.outbox, effect_id, "worker-a")
-    assert scheduler.outbox.complete(
-        effect_id, {"executed": {"ok": True}, "status": "EXECUTED"},
-        "observation-completed-repair", **token
+    queue_claim = scheduler.queue.claim_item(
+        "completed-queue-repair", worker_id="worker-a"
     )
+    assert queue_claim is not None
+    token = claim_args(
+        scheduler.outbox, effect_id, "worker-a",
+        queue_claim_generation=queue_claim.claim_generation,
+    )
+    # Construct the legacy split-projection state directly: public wrappers
+    # now reject this one-table completion for linked effects.
     with scheduler._conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        assert EffectOutbox._complete_with_conn(
+            conn,
+            effect_id,
+            {"executed": {"ok": True}, "status": "EXECUTED"},
+            "observation-completed-repair",
+            worker_id=token["worker_id"],
+            claim_generation=token["claim_generation"],
+        )
         conn.execute(
-            "UPDATE cognitive_queue SET status=? WHERE id=?",
-            (ItemStatus.UNKNOWN.value, "completed-queue-repair")
+            "UPDATE cognitive_queue SET status=?,worker_id=NULL WHERE id=?",
+            (ItemStatus.UNKNOWN.value, "completed-queue-repair"),
         )
     result = scheduler.reconcile_effect(effect_id, "executed")
     assert result["changed"] is False
