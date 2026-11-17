@@ -1,6 +1,6 @@
 # VictorOS scheduler crash-retry hardening (isolated candidate)
 
-Status: PARTIAL RUNTIME MITIGATION (2026-10-26), DRAFT. An in-flight action quarantine is integrated on this branch; the transactional outbox and provider idempotency contract are NOT implemented. Do not merge until exact-head CI and independent review.
+Status: PARTIAL RUNTIME MITIGATION (2026-10-26), DRAFT — see the 2026-11-05 addendum at the end: the transactional outbox is now integrated in the scheduler path as a draft for Issue #19. Do not merge until exact-head CI and independent review.
 
 ## Confirmed failure window
 The current scheduler persists ACTION_CANDIDATE, calls physiology.execute(), then records capability_results. A process exit after the capability side effect but before result storage strands a PROCESSING item, which the default-branch startup logic resets to PENDING, risking duplicate side effects.
@@ -41,6 +41,298 @@ The current draft branch now changes only `vos_core/cognitive_scheduler.py` and 
 
 This does not provide transactional intent/outbox persistence, stable provider idempotency keys, safe multi-worker leases, external receipt reconciliation, or exactly-once side effects. It only prevents one known automatic replay path. The P0 issue remains OPEN. Production promotion and merges remain blocked pending full outbox design, deterministic crash-injection acceptance, and owner approval.
 
+## 2026-11-05: transactional outbox integrated (draft, Issue #19)
+
+`vos_core/cognitive_scheduler.py` now carries the outbox this doc required,
+in the scheduler path only (no Chronos changes):
+
+- Stable effect ID (`eff_` + hash of capability + source item) and canonical
+  payload digest, recorded atomically with the action candidate; the same
+  effect ID with a different payload is rejected, never re-dispatched.
+- Concurrency-safe claim (one READY worker wins; expired CLAIMED leases are **not** re-claimed automatically),
+  the effect ID passed to the provider as the idempotency key.
+- Result + observation + outbox completion co-committed in one SQLite
+  transaction; a provider timeout is treated as ambiguous (UNKNOWN), not
+  terminal. Bounded transient-failure retries (3 attempts) then DLQ.
+- `CognitiveScheduler.reconcile_effect()` is the only path out of UNKNOWN:
+  provider-confirmed "executed" commits the outcome exactly once;
+  "not_executed" returns the claim to PENDING for one safe retry.
+- Crash-injection acceptance: `tests/test_issue19_outbox.py` (14 tests,
+  deterministic, no real process kill) plus the 22 pre-existing scheduler
+  tests, all green locally. Full suite: 127 passed, 2 pre-existing failures
+  (`test_vos_apps.py`, missing `streamlit` in the test env, unrelated).
+
+Honest limit, unchanged: without provider-supported idempotency or a
+provider receipt, exactly-once external execution cannot be promised.
+Production promotion still requires owner review of the draft PR.
+
 ### Rollback
 
 Revert the two 2026-10-26 code/test commits on this draft branch or close PR #18. No production data or schema migration is performed; the new status is a value in the existing SQLite `status` column.
+
+## 2026-11-08: expired-lease replay gate (draft)
+
+The outbox claim transition now permits **READY -> CLAIMED only**. A lease expiry
+alone cannot prove that the previous worker stopped a provider call; therefore
+an expired CLAIMED record cannot be reclaimed or dispatched by a second worker.
+Restart recovery moves unresolved CLAIMED records to UNKNOWN for explicit
+reconciliation. The existing two-worker regression now checks this fail-closed
+behavior after forcing lease expiry, including restart quarantine.
+
+This is a bounded replay-risk mitigation, **not** complete worker-generation
+fencing or provider-authenticated reconciliation. Live stale-worker completion,
+lease-expiry reconciliation without restart, and externally authenticated
+receipts remain outstanding. The draft must not merge or deploy without
+exact-head CI, independent review, and founder approval.
+
+## 2026-11-12: live-worker startup conflict — acceptance contract (draft, unimplemented)
+
+**Evidence:** PR #22 head `427c30fbec48801e58ba87af48d93d45fe9a6b19`,
+[Python Core Tests #43171755654](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43171755654)
+failed on Python 3.10; Python 3.11/3.12 jobs were cancelled. The two
+new live-second-instance tests fail against current startup recovery.
+No passing exact-head CI is claimed.
+
+### Root cause and forbidden shortcut
+
+`PersistentCognitiveQueue.__init__` resets all PROCESSING cognition
+(unknown action candidates, pending other items) and invokes
+`EffectOutbox.recover_claimed_to_unknown()` for **every** CLAIMED effect.
+A second *live* scheduler opening the same SQLite database can therefore
+invalidate work owned by the first. Earlier crash-injection tests assume
+that opening another scheduler proves the first died; it does not.
+**Do not** fix by disabling all recovery, relaxing either regression,
+trusting lease expiration as proof of death, or automatically replaying
+ambiguous provider calls.
+
+### Proposed bounded implementation contract (not yet code)
+
+1. Record a unique owner incarnation token at scheduler startup, plus a
+   durable claim generation and owner identity on each PROCESSING queue item
+   and CLAIMED outbox effect. Add schema columns via additive migration,
+   preserving existing records and indexes.
+2. Make claim acquisition, completion, release, transient failure, and
+   UNKNOWN transitions conditional on the exact owner **and generation**.
+   A stale callback must change zero rows and must not write a result,
+   observation, or provider receipt. Use one SQLite transaction for
+   completion and all its local consequences.
+3. Treat another scheduler's startup as **observation**, not a recovery
+   authority. An unexpired heartbeat is advisory, and an expired lease is
+   not proof of death. A confirmed-death or explicit operator recovery
+   operation may quarantine ambiguous effects to UNKNOWN, but never
+   re-dispatch them. If death cannot be proven, retain CLAIMED/PROCESSING
+   and surface a blocked-recovery diagnostic.
+4. Keep provider-authoritative reconciliation separate from worker
+   recovery. Caller-supplied outcome strings are not authenticated
+   provider evidence. Preserve the human STOP/approval and EUSS gates.
+5. Legacy rows with missing owner/generation must fail closed. Document
+   any operator recovery workflow before enabling migration or deployment.
+
+### Required deterministic acceptance matrix
+
+| Scenario | Required outcome |
+| --- | --- |
+| Worker A owns live CLAIMED effect; worker B initializes | A claim unchanged; B cannot dispatch |
+| Worker A owns live PROCESSING cognition; B initializes | A item unchanged; B cannot pop it |
+| A lease expires while A still runs | B cannot steal, quarantine, or replay |
+| A completes with current owner/generation | One atomic result, observation and completion |
+| A stale completion/release/failure arrives after generation changes | Zero mutation; explicit conflict |
+| A is confirmed dead before provider ACK | Quarantine ambiguous effect; no replay |
+| Provider execution outcome remains unknown | UNKNOWN persists until authoritative reconciliation |
+| Provider confirms non-execution with auditable evidence | Controlled retry permitted, subject to governance |
+| Old schema or unknown owner | Additive migration; fail closed until reconciled |
+
+### Verification and rollback gate
+
+Run `python -m pytest tests/test_issue19_outbox.py -q`,
+`python -m pytest tests/test_cognitive_scheduler.py -q`, and
+`python -m pytest tests/ -q`; require passing exact-head Python 3.10,
+3.11, and 3.12 CI. Record commands and actual results. The existing
+crash tests must be adjusted only to model **confirmed death explicitly**,
+not to lower their no-replay assertions. Keep PR #22 draft and unmerged
+until independent review and founder approval. Roll back a future code
+change by reverting its draft-branch commit; do not reverse an applied
+schema migration or alter production data without a separate approved plan.
+
+**This appendix is a design/acceptance artifact only. It does not repair
+the failing tests or establish production safety.**
+
+## 2026-11-14: implementation-status reconciliation and remaining gate
+
+**Evidence scope:** Inspected the exact draft branch source and PR #22 metadata on
+2026-11-14. This corrects the historical 2026-11-12 heading above: the
+startup-recovery mitigation is **implemented**, but the full ownership-fencing
+acceptance contract is **not**. Historical failed-CI evidence remains historical.
+
+- `PersistentCognitiveQueue.__init__` now only initializes the schema and
+  outbox; it does **not** implicitly reset another live scheduler's
+  PROCESSING/CLAIMED rows. This is a partial fix, not worker fencing.
+- `recover_after_confirmed_shutdown(confirmed_terminated=True)` is an
+  explicit operator-gated path. Its Boolean argument is a caller assertion,
+  **not proof** that all old workers are dead. Its queue updates and the
+  subsequent outbox-wide quarantine are separate transactions; do not
+  advertise this as a single atomic recovery operation.
+- `EffectOutbox.claim` still transitions only READY to CLAIMED atomically.
+  `release_claim`, `mark_unknown`, `record_transient_failure`, and ordinary
+  `_complete_with_conn` do not require a matching worker incarnation and
+  claim generation. `_execute` derives worker_id from process-local
+  `id(self)` and tick, which is not a durable fencing token.
+- PR #22 head inspected: `b27ebba497fb710dab107b57f5c3cbc078fb2b3d`.
+  Existing Python Core Tests workflow #43542729852 is recorded successful
+  for that head; this addendum did **not** execute new tests or prove
+  distributed worker safety.
+
+**Next bounded code objective (not implemented by this documentation commit):**
+add an incrementing durable claim generation and owner-incarnation field with
+additive SQLite migration; return the claim token on acquisition; pass it
+through all dispatch callback paths; enforce owner+generation in conditional
+UPDATE predicates; require completion result/observation and outbox transition
+to share one transaction; fail closed on missing legacy tokens. Add tests for
+stale completion, release, transient failure, quarantine, live second worker,
+expired lease, and legacy rows. Keep operator recovery and authenticated
+provider reconciliation as separate review gates. Require targeted pytest,
+full-suite checks and exact-head Python 3.10–3.12 CI before any merge.
+
+**Approval:** draft only. Do not merge, deploy, change production schema, or
+claim exactly-once external effects without independent review and explicit
+founder approval. Documentation rollback: revert this addendum commit on the
+draft branch; no production migration is involved.
+
+
+## 2026-11-14: durable claim-generation fencing implementation candidate
+
+**Objective:** Prevent a delayed callback from an earlier outbox claim from mutating a later claim of the same effect, including when the same scheduler incarnation reacquires the effect.
+
+**Implementation on this draft branch:**
+- Added `claim_generation INTEGER NOT NULL DEFAULT 0` to new outbox tables and an additive `ALTER TABLE` migration for existing SQLite databases. Existing rows retain their data and start at generation zero.
+- Added `EffectOutbox.claim_with_token()`; every successful READY-to-CLAIMED transition increments and returns the claim generation with the worker ID. The existing boolean `claim()` wrapper remains for callers that only need claim success.
+- Ordinary release, UNKNOWN quarantine, transient-failure, and completion transitions now require the originating worker ID and claim generation in their conditional SQL predicates. Missing tokens fail closed; stale tokens change zero rows.
+- Scheduler instances now use a UUID worker-incarnation identifier, and `_execute()` propagates the claim token through rejection release, ambiguous-failure quarantine, and the result/observation/outbox completion transaction.
+- Regression coverage now exercises same-worker release/reacquire, stale release/quarantine/completion/failure callbacks, and additive migration from a legacy outbox schema.
+
+**Files:** `vos_core/cognitive_scheduler.py`, `tests/test_issue19_outbox.py`.
+
+**Verification:** Exact code-and-test head `070c6f68d3e46a911f1994e3db44805cc79d6b13` passed [Python Core Tests workflow #43624240980](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43624240980). The workflow ran `python -m pytest tests/ -q` on Python 3.10, 3.11, and 3.12:
+- Python 3.10: **151 passed**
+- Python 3.11: **151 passed**
+- Python 3.12: **151 passed, 108 warnings**
+
+These are GitHub-hosted CI results. No local pytest run is claimed. The workflow uses `actions/checkout@v4` and `actions/setup-python@v5`; GitHub logged a Node.js 20 deprecation warning for those actions. This maintenance change did not alter the workflow.
+
+**Residual risks and limits:** The migration is additive and regression-tested, but production database rollout has not occurred. The caller-supplied provider receipt/outcome remains unauthenticated by this change. `recover_after_confirmed_shutdown(confirmed_terminated=True)` still represents an external operator assertion, not independent proof of process termination; its queue and outbox recovery steps are not one atomic transaction. This does not establish distributed exactly-once external execution. Keep UNKNOWN reconciliation and human approval gates separate.
+
+**Rollback:** Revert the code, test, and documentation commits on this draft branch. Do not reverse a production migration or alter production data as part of this draft rollback.
+
+**Historical scope note (superseded 2026-11-14):** At the time of this earlier outbox-only change, `cognitive_queue` PROCESSING rows lacked owner/generation tokens. The dated implementation section below adds those fences. Provider-receipt authentication and independent worker-termination proof remain open.
+
+**Approval:** Draft only. Require independent review of all token-bearing callback paths, production migration planning, provider-authenticated reconciliation, and explicit founder approval before merge or deployment.
+
+
+## November 14, 2026 — cognitive queue claim-generation fencing implemented (draft PR)
+
+- Additive `cognitive_queue.worker_id` and `claim_generation` columns preserve existing rows; legacy rows begin at generation zero.
+- `claim_item()` and `pop_budgeted()` atomically assign a worker incarnation and increment the generation. Returned `CognitiveItem` values carry the exact token.
+- Ordinary PROCESSING transitions require the original worker ID and generation through `mark_claimed()`. The compatibility `mark()` method refuses to mutate live PROCESSING claims and cannot quarantine an unclaimed action candidate.
+- The scheduler uses one UUID worker incarnation for cognitive-queue and outbox claims. The selected action queue row is completed in the same SQLite transaction as its capability result, observation, and outbox completion. Governance rejection releases the outbox and completes the queue item in that same transaction.
+- Added regressions for stale cognition and action-candidate callbacks after recovery/reclaim (including same-worker generation reuse), legacy schema migration without row loss, token-required transitions, co-committed queue/outbox completion, and repair of a quarantined queue projection when its outbox result is already COMPLETED.
+- Recovery remains operator-gated. The `confirmed_terminated=True` argument is still an external assertion, not independent proof of process termination. Fencing prevents stale state transitions; it does not prove that a live process stopped performing non-transactional reasoning work.
+- Earlier code/test commit `339cc910c94ed744e0cc70ce98c34952d501ffb1` passed 156 tests on Python 3.10, 3.11, and 3.12 in run #43630799647. The action-candidate-specific stale-callback test was added in commit `1edae8f9c9a581c01d2065b398fad947edcc25e0`. Its first run (#43631422191, head `07d88cffc2214edf37987c0c17efaca210c5fbfc`) executed 156 tests successfully and failed only the new test's assertion because it expected `unknown_actions`; the recovery API returns `quarantined_actions`. The assertion was corrected in commit `bc673cb7bf9fba81c75f0ee5d74478ca34c2d924`. The corrected code/test head `29ee4d3df0518249db82ff70df3661e83ba5fbe2` passed **157 tests on each of Python 3.10, 3.11, and 3.12** in [GitHub Actions run #43631519150](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43631519150). Python 3.12 reported 108 deprecation warnings; the workflow also reports Node.js 20 action deprecation notices.
+- Provider-receipt authenticity and distributed exactly-once external execution remain unresolved.
+## 2026-11-14: atomic confirmed-shutdown recovery (draft)
+
+This update supersedes the earlier split-transaction recovery limitation
+recorded above. The recovery method now applies the cognitive queue
+transitions and the outbox CLAIMED-to-UNKNOWN quarantine through the same
+SQLite connection and transaction. If any part of the recovery raises, the
+transaction rolls back both tables together.
+
+The new regression test
+`test_confirmed_shutdown_recovery_is_atomic_across_queue_and_outbox`
+injects a failure after the queue updates and verifies that the action,
+thought, and outbox claims all remain unchanged; it then verifies a successful
+recovery moves the action and effect to UNKNOWN, requeues the thought, and
+clears stale worker ownership from all recovered queue/outbox rows.
+
+The operator gate is unchanged: `confirmed_terminated=True` is still a
+caller assertion, not independent proof that all workers have terminated.
+Recovery must only be invoked after exclusive termination is established.
+This change does not authenticate provider receipts or establish exactly-once
+external execution. UNKNOWN effects remain quarantined pending the existing
+reconciliation and human-approval gates.
+
+**Verification:** Exact-head GitHub Actions is pending for this addendum. No
+local test run is claimed. Require the targeted outbox suite, full `tests/`
+suite, and Python 3.10/3.11/3.12 CI before merge. Keep PR #22 draft and
+unmerged pending independent review and explicit founder approval.
+
+**Rollback:** Revert the three commits for this addendum on the draft branch.
+No production database migration or production state change is performed.
+
+## 2026-11-14: cognition persistence shares the queue claim transaction
+
+The earlier residual window in which `VictorCognitionStack.cycle()` could
+commit internal memories, plans, or proposed actions before the scheduler
+revalidated its queue claim is now closed for scheduler-driven cognition.
+
+- The scheduler requires the cognition stack and queue/outbox to use the same
+  SQLite database. Split database paths fail closed at construction.
+- Each claimed item is processed under one `BEGIN IMMEDIATE` transaction:
+  the exact worker/generation claim is checked first, the cognition cycle
+  writes through that same connection, and the parent claim plus follow-up
+  thoughts are committed before the transaction is released.
+- A superseded worker cannot persist the cognition cycle. A follow-up insert
+  or commit failure rolls back both cognition state and queue completion;
+  the in-memory stack tick is restored on rollback.
+- Standalone `VictorCognitionStack.cycle()` calls retain their existing
+  self-managed transaction behavior. The optional connection path is additive.
+
+This closes the scheduler-to-cognition claim window; it does not authenticate
+provider receipts, prove process termination, or establish exactly-once
+external effects. Provider reconciliation and founder approval gates remain
+unchanged. The longer writer transaction can increase SQLite write contention;
+lock timeouts remain fail-closed rather than bypassing the claim check.
+
+
+
+## 2026-11-15: linked queue projections require atomic reconciliation
+
+The public `PersistentCognitiveQueue.reconcile_mark()` method now acquires
+`BEGIN IMMEDIATE` before checking whether an `effect_outbox` row references
+the queue item. If any link exists, the queue-only API rejects the transition
+and directs callers to `CognitiveScheduler.reconcile_effect()`. This closes
+a public state-transition path that could otherwise update the queue
+projection without committing the corresponding outbox transition.
+
+The writer lock serializes the link check with `record_intent()`, including
+the case where an existing READY standalone intent is being attached to a
+queue item. Unlinked UNKNOWN action candidates retain the explicit queue-only
+recovery path; linked effects must use the existing atomic scheduler method.
+
+Regression coverage attempts both PENDING and COMPLETED queue-only transitions
+against a linked UNKNOWN effect and verifies that both records remain unchanged.
+Existing unlinked recovery tests remain in place. No schema migration,
+dependency, provider-trust claim, model-authority change, deployment, or
+approval-gate change is introduced.
+
+## 2026-11-16: linked outbox transition boundaries and persisted action projection reuse
+
+This follow-up closes public one-table mutation paths for linked queue/outbox effects and fixes a persisted-action requeue defect found while exercising the new claim fence.
+
+- `EffectOutbox.claim_with_token()` and its `claim()` compatibility wrapper now require the matching active cognitive-queue worker ID and claim generation whenever an effect has a `queue_item_id`. Standalone outbox effects retain their existing call shape.
+- Public `release_claim()`, `complete()`, `mark_unknown()`, and `record_transient_failure()` now reject linked effects. The scheduler continues to use connection-scoped transition helpers inside its existing queue/outbox transaction.
+- An ambiguous linked provider failure now changes the outbox row and its action-queue projection to `UNKNOWN` under one `BEGIN IMMEDIATE` transaction. If the queue fencing token is stale, the outbox quarantine rolls back with it.
+- `tick()` now recognizes a persisted `ACTION_CANDIDATE` as an already-durable queue projection. It reuses that row's claim token instead of completing the row and inserting a second queue row for the same stable effect. Duplicate projections are completed without dispatch; the first queue projection remains canonical. Unselected preclaimed candidates are returned to `PENDING` without changing their outbox intent.
+- Regression tests cover missing/stale queue generations, all four public outbox-only mutators, atomic quarantine rollback, duplicate projection deduplication, and continued scheduler/runtime behavior.
+
+**Verification:** Exact code-and-test head `c8e211f29699ee9de654d3340033c901af171a05` passed [Python Core Tests run #43986732080](https://github.com/MASSIVEMAGNETICS/victorOS/actions/runs/43986732080):
+- Python 3.10: **188 passed**
+- Python 3.11: **188 passed**
+- Python 3.12: **188 passed, 108 warnings**
+
+The Python 3.12 warnings are existing deprecations in other runtime modules. GitHub also reports the existing Node.js 20 action deprecation warning for `actions/checkout@v4` and `actions/setup-python@v5`; this follow-up did not change CI actions or suppress warnings.
+
+**Scope and limits:** No schema migration, provider integration, credential change, deployment, model-authority change, EUSS change, or approval-gate change. Provider receipt authenticity remains an external approval requirement. This is local SQLite queue/outbox consistency, not a claim of distributed exactly-once execution when a provider does not honor idempotency keys. The existing `confirmed_terminated=True` recovery argument remains an operator assertion, not independent proof of process termination.
+
+**Rollback:** Revert the follow-up code, test, and documentation commits on this draft branch. No production database or external provider state was changed.
+
+**Approval:** PR #22 remains draft and unmerged. Require independent review of all linked transition paths and explicit founder approval before merge or deployment.

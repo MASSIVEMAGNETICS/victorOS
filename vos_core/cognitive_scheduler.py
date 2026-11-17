@@ -70,6 +70,10 @@ class CognitiveItem:
     created_tick: int
     ttl: int = DEFAULT_TTL_TICKS
     status: ItemStatus = ItemStatus.PENDING
+    # Durable fencing token for the most recent claim. The generation advances
+    # on every successful claim, including a retry by the same worker ID.
+    worker_id: Optional[str] = None
+    claim_generation: int = 0
     
     # For PriorityQueue sorting: highest priority first, then oldest first
     def __lt__(self, other: 'CognitiveItem') -> bool:
@@ -84,25 +88,536 @@ def _canonical_json(value: Any) -> str:
 def _hash_payload(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
-class PersistentCognitiveQueue:
-    """SQLite-backed priority queue. Pending thoughts survive process death/reboot."""
+def stable_effect_id(capability: str, source_item_id: Optional[str]) -> str:
+    """Deterministic effect ID for one capability dispatch from one source.
+
+    The same source + capability always yields the same effect ID, so a
+    re-derived candidate after a crash maps to the same outbox record and
+    the same provider idempotency key. The payload digest is stored
+    separately: the same effect ID with a different payload is a conflict,
+    never a silent re-dispatch.
+    """
+    key = {"capability": str(capability), "source_item_id": str(source_item_id or "")}
+    return "eff_" + _hash_payload(key)[:32]
+
+def effect_id_for_candidate(candidate: Dict[str, Any]) -> str:
+    return stable_effect_id(candidate.get("capability"), candidate.get("source_item_id"))
+
+def _payload_digest(payload: Any) -> str:
+    return _hash_payload(payload or {})
+
+# Outbox statuses. READY = intent recorded, never dispatched. CLAIMED = one
+# worker holds a bounded lease. COMPLETED = outcome durably recorded.
+# UNKNOWN = ambiguous outcome, fail-closed quarantine, never auto-replayed.
+# FAILED = DLQ: transient-failure budget exhausted, terminal.
+OUTBOX_MAX_ATTEMPTS = 3
+_AMBIGUOUS_ERROR_TYPES = ("TimeoutError", "ConnectionError", "Timeout")
+
+class EffectOutbox:
+    """Durable transactional outbox for capability effects.
+
+    Lives in the same SQLite file as the cognitive queue so intent records,
+    claims and completions are atomic with the queue rows they guard. This
+    is the Issue #19 fix: a stable effect ID + payload digest is recorded
+    before any external dispatch, dispatch carries that ID as the provider
+    idempotency key, and completion is co-committed with the capability
+    result and observation. Without provider-supported idempotency or a
+    provider receipt, exactly-once external execution cannot be promised;
+    ambiguous outcomes stay UNKNOWN until explicit reconciliation.
+    """
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
-        # Capability effects may already have happened when the process died.
-        # Quarantine ambiguous action claims; never replay them automatically.
-        # Non-capability cognition can still resume from its pending queue.
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def _init_schema(self):
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=? AND kind=?",
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS effect_outbox(
+                effect_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL,
+                source_item_id TEXT,
+                queue_item_id TEXT,
+                payload_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                worker_id TEXT,
+                claim_generation INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at TEXT,
+                result_json TEXT,
+                observation_event_id TEXT UNIQUE,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_status
+              ON effect_outbox(status, created_at ASC);
+            """)
+
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(effect_outbox)")}
+            if "claim_generation" not in columns:
+                conn.execute(
+                    "ALTER TABLE effect_outbox ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0"
+                )
+
+    @staticmethod
+    def _row_dict(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["attempts"] = int(d["attempts"])
+        d["max_attempts"] = int(d["max_attempts"])
+        d["claim_generation"] = int(d.get("claim_generation") or 0)
+        return d
+
+    @staticmethod
+    def _record_with_conn(conn, effect_id, capability, source_item_id,
+                          payload_digest, queue_item_id=None, max_attempts=OUTBOX_MAX_ATTEMPTS):
+        now = _utcnow()
+        conn.execute("""
+          INSERT OR IGNORE INTO effect_outbox
+          (effect_id, capability, source_item_id, queue_item_id, payload_digest,
+           idempotency_key, status, attempts, max_attempts, created_at, updated_at)
+          VALUES(?,?,?,?,?,?, 'READY', 0, ?, ?, ?)
+        """, (effect_id, str(capability), str(source_item_id) if source_item_id is not None else None,
+              queue_item_id, payload_digest, effect_id, int(max_attempts), now, now))
+        row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        if row is None:
+            raise RuntimeError(f"effect outbox intent not recorded: {effect_id}")
+        expected_source_item_id = (
+            str(source_item_id) if source_item_id is not None else None
+        )
+        if (row["capability"] != str(capability)
+                or row["source_item_id"] != expected_source_item_id):
+            raise ValueError(
+                f"effect_id {effect_id} already recorded with a different "
+                "capability/source identity; refusing to reuse the intent")
+        if row["payload_digest"] != payload_digest:
+            raise ValueError(
+                f"effect_id {effect_id} already recorded with a different payload digest; "
+                "refusing to dispatch")
+        if queue_item_id is not None and row["queue_item_id"] is None:
+            queue_item_id = str(queue_item_id)
+            if row["status"] in ("CLAIMED", "UNKNOWN"):
+                raise ValueError(
+                    f"effect_id {effect_id} cannot attach a queue projection "
+                    f"while status is {row['status']}")
+            # One stable effect may be referenced by duplicate queue candidates.
+            # Preserve the first queue projection as canonical; later candidates
+            # are deduplicated by effect_id and must not rebind that projection.
+            changed = conn.execute("""
+                UPDATE effect_outbox SET queue_item_id=?, updated_at=?
+                WHERE effect_id=? AND queue_item_id IS NULL
+                  AND status NOT IN ('CLAIMED', 'UNKNOWN')
+            """, (queue_item_id, now, effect_id)).rowcount
+            if changed != 1:
+                row = conn.execute(
+                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"effect outbox intent disappeared during link: {effect_id}"
+                    )
+                if row["queue_item_id"] is None:
+                    if row["status"] in ("CLAIMED", "UNKNOWN"):
+                        raise ValueError(
+                            f"effect_id {effect_id} cannot attach a queue projection "
+                            f"while status is {row['status']}")
+                    raise RuntimeError(
+                        f"effect_id {effect_id} queue projection was not attached")
+            else:
+                row = conn.execute(
+                    "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+                ).fetchone()
+        return EffectOutbox._row_dict(row)
+
+    def record_intent(self, effect_id, capability, source_item_id, payload_digest,
+                      queue_item_id=None, max_attempts=OUTBOX_MAX_ATTEMPTS) -> Dict[str, Any]:
+        with self._conn() as conn:
+            return self._record_with_conn(conn, effect_id, capability, source_item_id,
+                                          payload_digest, queue_item_id, max_attempts)
+
+    def get(self, effect_id) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        return self._row_dict(row)
+
+    @staticmethod
+    def _require_claim_token(worker_id, claim_generation):
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id is required for claim transition")
+        if type(claim_generation) is not int or claim_generation < 1:
+            raise ValueError("claim_generation must be a positive integer")
+        return worker_id, claim_generation
+
+    @staticmethod
+    def _require_standalone_effect_with_conn(conn, effect_id, operation):
+        """Reject one-table mutations when an effect has a queue projection."""
+        row = conn.execute(
+            "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+        if row is not None and row["queue_item_id"] is not None:
+            raise RuntimeError(
+                "linked outbox effects must use CognitiveScheduler's atomic "
+                f"{operation} path"
+            )
+        return row
+
+    def claim_with_token(
+        self, effect_id, worker_id, lease_seconds: int = 30,
+        *, queue_claim_generation: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Claim a standalone effect, or a linked effect under its queue claim.
+
+        Linked effects require the matching PROCESSING queue claim token. This
+        prevents a public outbox-only claim from splitting the two projections
+        or accepting a stale generation from the same worker incarnation.
+        """
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id is required")
+        import datetime as _dt
+        lease_until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(lease_seconds))).isoformat()
+        now = _utcnow()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            intent = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if intent is None:
+                return None
+            queue_item_id = intent["queue_item_id"]
+            if queue_item_id is not None:
+                if type(queue_claim_generation) is not int or queue_claim_generation < 1:
+                    raise ValueError(
+                        "queue_claim_generation is required for linked outbox claim"
+                    )
+                queue_claim = conn.execute(
+                    """SELECT status, worker_id, claim_generation
+                       FROM cognitive_queue WHERE id=?""",
+                    (queue_item_id,),
+                ).fetchone()
+                if (
+                    queue_claim is None
+                    or queue_claim["status"] != ItemStatus.PROCESSING.value
+                    or queue_claim["worker_id"] != worker_id
+                    or int(queue_claim["claim_generation"]) != queue_claim_generation
+                ):
+                    raise RuntimeError(
+                        "linked outbox claim requires the matching active "
+                        "cognitive-queue claim"
+                    )
+            changed = conn.execute("""
+              UPDATE effect_outbox
+              SET status='CLAIMED', worker_id=?, lease_expires_at=?,
+                  attempts=attempts+1, claim_generation=claim_generation+1,
+                  updated_at=?
+              WHERE effect_id=? AND status='READY'
+            """, (worker_id, lease_until, now, effect_id)).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute(
+                "SELECT claim_generation FROM effect_outbox WHERE effect_id=? AND status='CLAIMED' AND worker_id=?",
+                (effect_id, worker_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("claimed effect disappeared before token read")
+            return {
+                "worker_id": worker_id,
+                "claim_generation": int(row["claim_generation"]),
+            }
+
+    def claim(
+        self, effect_id, worker_id, lease_seconds: int = 30,
+        *, queue_claim_generation: Optional[int] = None,
+    ) -> bool:
+        """Compatibility predicate; linked effects require the queue claim token."""
+        return self.claim_with_token(
+            effect_id, worker_id, lease_seconds,
+            queue_claim_generation=queue_claim_generation,
+        ) is not None
+
+    @staticmethod
+    def _release_claim_with_conn(conn, effect_id, worker_id, claim_generation) -> bool:
+        worker_id, claim_generation = EffectOutbox._require_claim_token(
+            worker_id, claim_generation
+        )
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='READY', worker_id=NULL,
+            lease_expires_at=NULL, updated_at=?
+          WHERE effect_id=? AND status='CLAIMED'
+            AND worker_id=? AND claim_generation=?
+        """, (_utcnow(), effect_id, worker_id, claim_generation)).rowcount
+        return bool(changed)
+
+    def release_claim(self, effect_id, *, worker_id=None, claim_generation=None) -> bool:
+        """Release only the exact active claim that provably never dispatched."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "claim release")
+            return self._release_claim_with_conn(
+                conn,effect_id,worker_id,claim_generation
+            )
+
+    @staticmethod
+    def _complete_with_conn(conn, effect_id, result, observation_event_id,
+                            expected_status="CLAIMED", *, worker_id=None,
+                            claim_generation=None):
+        """Complete UNKNOWN only through reconciliation; fence ordinary claims."""
+        if expected_status not in ("CLAIMED", "UNKNOWN"):
+            raise ValueError("invalid outbox completion state")
+        where = "WHERE effect_id=? AND status=?"
+        params = (_canonical_json(result), observation_event_id, _utcnow(),
+                  effect_id, expected_status)
+        if expected_status == "CLAIMED":
+            worker_id, claim_generation = EffectOutbox._require_claim_token(
+                worker_id, claim_generation)
+            where += " AND worker_id=? AND claim_generation=?"
+            params += (worker_id, claim_generation)
+        changed = conn.execute(f"""
+          UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+            observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+          {where}
+        """, params).rowcount
+        return bool(changed)
+
+    def complete(self, effect_id, result, observation_event_id, *,
+                 worker_id=None, claim_generation=None) -> bool:
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "completion")
+            return self._complete_with_conn(
+                conn, effect_id, result, observation_event_id,
+                worker_id=worker_id, claim_generation=claim_generation)
+
+    @staticmethod
+    def _mark_unknown_with_conn(conn, effect_id, error=None, *,
+                                worker_id=None, claim_generation=None) -> bool:
+        """Quarantine the exact claim inside a caller-owned transaction."""
+        worker_id, claim_generation = EffectOutbox._require_claim_token(
+            worker_id, claim_generation
+        )
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='UNKNOWN', error=?, worker_id=NULL,
+            lease_expires_at=NULL, updated_at=?
+          WHERE effect_id=? AND status='CLAIMED'
+            AND worker_id=? AND claim_generation=?
+        """, (str(error)[:500] if error else None, _utcnow(),
+              effect_id, worker_id, claim_generation)).rowcount
+        return bool(changed)
+
+    def mark_unknown(self, effect_id, error: Optional[str] = None, *,
+                     worker_id=None, claim_generation=None) -> bool:
+        """Quarantine only a standalone effect's exact active claim."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_standalone_effect_with_conn(conn, effect_id, "quarantine")
+            return self._mark_unknown_with_conn(
+                conn, effect_id, error,
+                worker_id=worker_id, claim_generation=claim_generation,
+            )
+
+    def record_transient_failure(self, effect_id, error: Optional[str] = None, *,
+                                 worker_id=None, claim_generation=None) -> Dict[str, Any]:
+        """Account a confirmed non-execution failure for the exact active claim.
+
+        Returns the record to READY while attempts remain, otherwise moves it
+        to FAILED (dead-letter queue). Ambiguous failures must use mark_unknown.
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            if row["queue_item_id"] is not None:
+                raise RuntimeError(
+                    "linked outbox effects must use CognitiveScheduler's atomic "
+                    "transient-failure path"
+                )
+            worker_id, claim_generation = self._require_claim_token(
+                worker_id, claim_generation)
+            attempts = int(row["attempts"])
+            status = "FAILED" if attempts >= int(row["max_attempts"]) else "READY"
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status=?, error=?,
+                worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='CLAIMED'
+                AND worker_id=? AND claim_generation=?
+            """, (status, str(error)[:500] if error else None, _utcnow(),
+                  effect_id, worker_id, claim_generation)).rowcount
+            if changed != 1:
+                raise ValueError(
+                    f"effect {effect_id} claim token is stale or no longer CLAIMED")
+            row = conn.execute("SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)).fetchone()
+        return self._row_dict(row)
+
+    @staticmethod
+    def _recover_claimed_to_unknown_with_conn(conn) -> int:
+        """Quarantine every claimed effect using the caller's transaction."""
+        changed = conn.execute("""
+          UPDATE effect_outbox SET status='UNKNOWN', worker_id=NULL,
+            lease_expires_at=NULL, updated_at=?
+          WHERE status='CLAIMED'
+        """, (_utcnow(),)).rowcount
+        return int(changed)
+
+    def recover_claimed_to_unknown(self, *, confirmed_terminated: bool = False) -> int:
+        """Recover standalone outbox claims only after confirmed worker termination.
+
+        Claims linked to cognitive_queue rows must use
+        PersistentCognitiveQueue.recover_after_confirmed_shutdown so both
+        projections change in one transaction. The boolean is an explicit
+        caller assertion, not independent proof; lease expiry is not proof.
+        """
+        if confirmed_terminated is not True:
+            raise PermissionError(
+                "recovery requires confirmed termination of all previous workers"
+            )
+        with self._conn() as conn:
+            # Acquire the writer lock before checking links so a concurrent
+            # intent/claim cannot appear between the guard and quarantine.
+            conn.execute("BEGIN IMMEDIATE")
+            linked_claim = conn.execute("""
+                SELECT 1 FROM effect_outbox
+                WHERE status='CLAIMED' AND queue_item_id IS NOT NULL
+                LIMIT 1
+            """).fetchone()
+            if linked_claim is not None:
+                raise RuntimeError(
+                    "linked outbox claims must be recovered atomically through "
+                    "PersistentCognitiveQueue.recover_after_confirmed_shutdown"
+                )
+            return self._recover_claimed_to_unknown_with_conn(conn)
+
+    @staticmethod
+    def _reconcile_with_conn(conn, effect_id, outcome, provider_receipt=None,
+                             result=None, observation_event_id=None) -> Dict[str, Any]:
+        """Reconcile one UNKNOWN outbox row inside the caller's transaction."""
+        if outcome not in ("executed", "not_executed", "unknown"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
+        row = conn.execute(
+            "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown effect_id: {effect_id}")
+        current = EffectOutbox._row_dict(row)
+        if outcome == "unknown":
+            return {**current, "changed": False}
+        if current["status"] == "COMPLETED":
+            if outcome == "executed":
+                return {**current, "changed": False}
+            raise ValueError(
+                f"effect {effect_id} already recorded COMPLETED; "
+                "provider 'not_executed' contradicts the recorded outcome")
+        if current["status"] != "UNKNOWN":
+            raise ValueError(
+                f"effect {effect_id} in {current['status']} cannot be reconciled; "
+                "only UNKNOWN effects may transition")
+        if outcome == "not_executed":
+            stored = result if result is not None else {
+                "reconciled": True, "provider_receipt": provider_receipt,
+                "outcome": "not_executed"}
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='READY', result_json=?, error=NULL,
+                worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='UNKNOWN'
+            """, (_canonical_json(stored), _utcnow(), effect_id)).rowcount
+        else:
+            stored = result if result is not None else {
+                "reconciled": True, "provider_receipt": provider_receipt,
+                "outcome": "executed"}
+            obs_id = observation_event_id or current.get("observation_event_id")
+            changed = conn.execute("""
+              UPDATE effect_outbox SET status='COMPLETED', result_json=?,
+                observation_event_id=?, worker_id=NULL, lease_expires_at=NULL, updated_at=?
+              WHERE effect_id=? AND status='UNKNOWN'
+            """, (_canonical_json(stored), obs_id, _utcnow(), effect_id)).rowcount
+        if changed != 1:
+            raise RuntimeError(f"effect {effect_id} reconciliation state changed")
+        updated = conn.execute(
+            "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        return {**EffectOutbox._row_dict(updated), "changed": True}
+
+    def reconcile(self, effect_id, outcome, provider_receipt=None, result=None,
+                  observation_event_id=None) -> Dict[str, Any]:
+        """Reconcile only a standalone outbox effect with no queue projection.
+
+        Linked effects must use CognitiveScheduler.reconcile_effect so the
+        outbox state and cognitive_queue projection change in one transaction.
+        """
+        if outcome not in ("executed", "not_executed", "unknown"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
+        with self._conn() as conn:
+            # Serialize the link check with any concurrent intent association.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            if outcome != "unknown" and row["queue_item_id"] is not None:
+                raise RuntimeError(
+                    "linked outbox effects must be reconciled atomically through "
+                    "CognitiveScheduler.reconcile_effect"
+                )
+            return self._reconcile_with_conn(
+                conn, effect_id, outcome, provider_receipt=provider_receipt,
+                result=result, observation_event_id=observation_event_id)
+
+
+
+class PersistentCognitiveQueue:
+    """SQLite-backed priority queue. Pending thoughts survive process death/reboot."""
+    def __init__(self, db_path: str | Path, worker_id: Optional[str] = None):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.worker_id = worker_id or f"queue-{uuid.uuid4().hex}"
+        if not isinstance(self.worker_id, str) or not self.worker_id:
+            raise ValueError("worker_id must be a non-empty string")
+        self._init_schema()
+        self.outbox = EffectOutbox(self.db_path)
+        # Construction is not evidence that another worker terminated.
+        # Never mutate another instance's in-flight cognition or outbox claim
+        # merely because this queue object was opened.
+
+    def recover_after_confirmed_shutdown(self, *, confirmed_terminated: bool = False) -> Dict[str, int]:
+        """Operator-gated recovery ONLY after exclusive worker termination is proven.
+
+        Caller must establish that ALL previous workers using this database
+        have terminated and no concurrent scheduler can resume. Lease expiry,
+        opening a new instance, and process-local exceptions are not proof.
+        Do not call during ordinary startup. External effects are quarantined,
+        never redispatched, pending authoritative provider reconciliation.
+        """
+        if confirmed_terminated is not True:
+            raise PermissionError("recovery requires confirmed termination of all previous workers")
+        # Queue and outbox rows share this SQLite database. Keep all recovery
+        # transitions in one transaction so an interrupted recovery cannot
+        # leave the local projections in different states.
+        with self._conn() as conn:
+            action_count = conn.execute(
+                "UPDATE cognitive_queue SET status=?, worker_id=NULL, updated_at=? WHERE status=? AND kind=?",
                 (ItemStatus.UNKNOWN.value, _utcnow(), ItemStatus.PROCESSING.value,
                  ItemKind.ACTION_CANDIDATE.value),
-            )
-            conn.execute(
-                "UPDATE cognitive_queue SET status=?, updated_at=? WHERE status=?",
+            ).rowcount
+            cognition_count = conn.execute(
+                "UPDATE cognitive_queue SET status=?, worker_id=NULL, updated_at=? WHERE status=?",
                 (ItemStatus.PENDING.value, _utcnow(), ItemStatus.PROCESSING.value),
-            )
+            ).rowcount
+            effect_count = EffectOutbox._recover_claimed_to_unknown_with_conn(conn)
+        return {"quarantined_actions": int(action_count),
+                "requeued_cognition": int(cognition_count),
+                "quarantined_effects": effect_count}
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path, timeout=30)
@@ -123,6 +638,8 @@ class PersistentCognitiveQueue:
                 created_tick INTEGER NOT NULL,
                 ttl INTEGER NOT NULL,
                 status TEXT NOT NULL,
+                worker_id TEXT,
+                claim_generation INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -155,6 +672,13 @@ class PersistentCognitiveQueue:
                 created_at TEXT NOT NULL
             );
             """)
+            queue_columns={row["name"] for row in conn.execute("PRAGMA table_info(cognitive_queue)")}
+            if "worker_id" not in queue_columns:
+                conn.execute("ALTER TABLE cognitive_queue ADD COLUMN worker_id TEXT")
+            if "claim_generation" not in queue_columns:
+                conn.execute(
+                    "ALTER TABLE cognitive_queue ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0"
+                )
             columns={row["name"] for row in conn.execute("PRAGMA table_info(capability_results)")}
             for name,definition in (
                 ("observation_event_id","TEXT"),
@@ -188,7 +712,141 @@ class PersistentCognitiveQueue:
         with self._conn() as conn:
             return self._insert_with_conn(conn,item)
 
-    def pop_budgeted(self,current_tick:int,max_items:int=8,max_ms:int=300)->List[CognitiveItem]:
+    def push_with_effect_intent(self, item: CognitiveItem, effect_id: str,
+                                capability: str, source_item_id, payload_digest: str) -> bool:
+        """Atomically persist an action candidate AND its outbox intent.
+
+        One transaction: either both the queue row and the intent record
+        exist, or neither does. A payload-digest conflict for the same
+        effect ID raises ValueError and rolls the whole transaction back.
+        """
+        with self._conn() as conn:
+            inserted = self._insert_with_conn(conn, item)
+            if not inserted:
+                return False
+            EffectOutbox._record_with_conn(conn, effect_id, capability, source_item_id,
+                                           payload_digest, queue_item_id=item.id)
+            return True
+
+    @staticmethod
+    def _reconcile_mark_with_conn(conn, item_id: str, status: ItemStatus,
+                                  *, allow_already_target: bool = False) -> bool:
+        """Move one UNKNOWN action projection within a caller-owned transaction."""
+        if status not in (ItemStatus.COMPLETED, ItemStatus.PENDING):
+            raise ValueError("reconciliation may only resolve UNKNOWN to COMPLETED or PENDING")
+        changed = conn.execute("""
+          UPDATE cognitive_queue SET status=?, updated_at=?
+          WHERE id=? AND kind=? AND status=?
+        """, (status.value, _utcnow(), item_id,
+              ItemKind.ACTION_CANDIDATE.value, ItemStatus.UNKNOWN.value)).rowcount
+        if changed == 1:
+            return True
+        if allow_already_target:
+            row = conn.execute(
+                "SELECT kind,status FROM cognitive_queue WHERE id=?", (item_id,)
+            ).fetchone()
+            if (row is not None
+                    and row["kind"] == ItemKind.ACTION_CANDIDATE.value
+                    and row["status"] == status.value):
+                return False
+        raise ValueError("only a quarantined UNKNOWN action candidate can be reconciled")
+
+    def reconcile_mark(self, item_id: str, status: ItemStatus):
+        """Reconcile only an unlinked UNKNOWN action projection.
+
+        Linked effects must use CognitiveScheduler.reconcile_effect() so the
+        outbox and queue projections are committed or rolled back together.
+        """
+        with self._conn() as conn:
+            # Serialize the link check with record_intent() attaching an
+            # existing READY effect to this queue item.
+            conn.execute("BEGIN IMMEDIATE")
+            linked = conn.execute(
+                "SELECT 1 FROM effect_outbox WHERE queue_item_id=? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            if linked is not None:
+                raise RuntimeError(
+                    "linked outbox effects must be reconciled atomically through "
+                    "CognitiveScheduler.reconcile_effect"
+                )
+            return self._reconcile_mark_with_conn(conn, item_id, status)
+
+
+    @staticmethod
+    def _require_claim_token(worker_id, claim_generation):
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id is required for queue claim transition")
+        if type(claim_generation) is not int or claim_generation < 1:
+            raise ValueError("claim_generation must be a positive integer")
+        return worker_id, claim_generation
+
+    @staticmethod
+    def _transition_claim_with_conn(conn, item_id, status, worker_id, claim_generation):
+        worker_id, claim_generation = PersistentCognitiveQueue._require_claim_token(
+            worker_id, claim_generation
+        )
+        if status is ItemStatus.PROCESSING:
+            raise ValueError("PROCESSING must be acquired through an atomic queue claim")
+        changed = conn.execute("""
+          UPDATE cognitive_queue SET status=?, updated_at=?
+          WHERE id=? AND status=? AND worker_id=? AND claim_generation=?
+        """, (status.value, _utcnow(), item_id, ItemStatus.PROCESSING.value,
+              worker_id, claim_generation)).rowcount
+        return bool(changed)
+
+    def claim_item(self, item_id: str, worker_id: Optional[str] = None) -> Optional[CognitiveItem]:
+        """Atomically claim one known PENDING item and return its fencing token."""
+        worker_id = worker_id or self.worker_id
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id must be a non-empty string")
+        with self._conn() as conn:
+            changed = conn.execute("""
+              UPDATE cognitive_queue
+              SET status=?, worker_id=?, claim_generation=claim_generation+1, updated_at=?
+              WHERE id=? AND status=?
+            """, (ItemStatus.PROCESSING.value, worker_id, _utcnow(),
+                  item_id, ItemStatus.PENDING.value)).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute("""
+              SELECT * FROM cognitive_queue
+              WHERE id=? AND status=? AND worker_id=?
+            """, (item_id, ItemStatus.PROCESSING.value, worker_id)).fetchone()
+            if row is None:
+                raise RuntimeError("claimed cognitive item disappeared before token read")
+        return self._row(row, ItemStatus.PROCESSING)
+
+    @staticmethod
+    def _owns_claim_with_conn(conn, item_id, *, worker_id, claim_generation) -> bool:
+        worker_id, claim_generation = PersistentCognitiveQueue._require_claim_token(
+            worker_id, claim_generation
+        )
+        row = conn.execute("""
+          SELECT 1 FROM cognitive_queue
+          WHERE id=? AND status=? AND worker_id=? AND claim_generation=?
+        """, (item_id, ItemStatus.PROCESSING.value, worker_id, claim_generation)).fetchone()
+        return row is not None
+
+    def assert_claim_owned_with_conn(self, conn, item_id, *, worker_id, claim_generation) -> None:
+        """Fail closed unless this exact worker generation still owns the row."""
+        if not self._owns_claim_with_conn(
+            conn, item_id, worker_id=worker_id, claim_generation=claim_generation
+        ):
+            raise PermissionError("cognitive claim is no longer owned by this worker generation")
+
+    def owns_claim(self, item_id: str, *, worker_id, claim_generation) -> bool:
+        worker_id, claim_generation = self._require_claim_token(worker_id, claim_generation)
+        with self._conn() as conn:
+            return self._owns_claim_with_conn(
+                conn, item_id, worker_id=worker_id, claim_generation=claim_generation
+            )
+
+    def pop_budgeted(self,current_tick:int,max_items:int=8,max_ms:int=300,
+                     worker_id:Optional[str]=None)->List[CognitiveItem]:
+        worker_id = worker_id or self.worker_id
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("worker_id must be a non-empty string")
         start=time.perf_counter(); out=[]
         while len(out)<max_items and (time.perf_counter()-start)*1000<max_ms:
             with self._conn() as conn:
@@ -198,42 +856,91 @@ class PersistentCognitiveQueue:
                 """,(ItemStatus.PENDING.value,)).fetchone()
                 if row is None: break
                 if current_tick-int(row["created_tick"])>int(row["ttl"]):
-                    conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
-                                 (ItemStatus.DROPPED_TTL.value,_utcnow(),row["id"]))
+                    conn.execute("""
+                      UPDATE cognitive_queue SET status=?,updated_at=?
+                      WHERE id=? AND status=?
+                    """,(ItemStatus.DROPPED_TTL.value,_utcnow(),row["id"],
+                         ItemStatus.PENDING.value))
                     continue
                 changed=conn.execute("""
-                  UPDATE cognitive_queue SET status=?,updated_at=?
+                  UPDATE cognitive_queue
+                  SET status=?,worker_id=?,claim_generation=claim_generation+1,updated_at=?
                   WHERE id=? AND status=?
-                """,(ItemStatus.PROCESSING.value,_utcnow(),row["id"],ItemStatus.PENDING.value)).rowcount
+                """,(ItemStatus.PROCESSING.value,worker_id,_utcnow(),row["id"],
+                     ItemStatus.PENDING.value)).rowcount
                 if not changed: continue
-            out.append(self._row(row,ItemStatus.PROCESSING))
+                claimed=conn.execute("""
+                  SELECT * FROM cognitive_queue
+                  WHERE id=? AND status=? AND worker_id=?
+                """,(row["id"],ItemStatus.PROCESSING.value,worker_id)).fetchone()
+                if claimed is None:
+                    raise RuntimeError("claimed cognitive item disappeared before token read")
+            out.append(self._row(claimed,ItemStatus.PROCESSING))
         return out
 
-    def mark(self,item_id:str,status:ItemStatus):
-        """Update a claim without releasing an ambiguous capability effect.
+    def mark_claimed(self,item_id:str,status:ItemStatus,*,worker_id,claim_generation)->bool:
+        """Transition only the exact worker/generation currently holding an item."""
+        with self._conn() as conn:
+            return self._transition_claim_with_conn(
+                conn,item_id,status,worker_id,claim_generation
+            )
 
-        UNKNOWN action claims are terminal for this generic queue API. A future
-        audited reconciliation path must establish the provider outcome before
-        any transition out of quarantine; ordinary cognition is unaffected.
-        The conditional UPDATE prevents a concurrent change from UNKNOWN from
-        being overwritten by a stale caller.
+    def complete_claim_with_followups_with_conn(self,conn,item_id:str,
+                                                followups:List[CognitiveItem],*,
+                                                worker_id,claim_generation)->Optional[int]:
+        """Complete a claim and publish follow-ups in the caller's transaction."""
+        if not self._transition_claim_with_conn(
+            conn,item_id,ItemStatus.COMPLETED,worker_id,claim_generation
+        ):
+            return None
+        inserted=0
+        for item in followups:
+            if self._insert_with_conn(conn,item):
+                inserted+=1
+        return inserted
+
+    def complete_claim_with_followups(self,item_id:str,followups:List[CognitiveItem],*,
+                                      worker_id,claim_generation)->Optional[int]:
+        """Complete one exact claim and insert its follow-up thoughts atomically."""
+        with self._conn() as conn:
+            return self.complete_claim_with_followups_with_conn(
+                conn,item_id,followups,worker_id=worker_id,
+                claim_generation=claim_generation
+            )
+
+    def mark(self,item_id:str,status:ItemStatus):
+        """Compatibility state API that cannot mutate a live or ambiguous claim.
+
+        PROCESSING ownership transitions require mark_claimed() with the durable
+        worker/generation token. ACTION_CANDIDATE quarantine is only permitted
+        from a live claim; UNKNOWN can leave only through reconcile_mark().
         """
         with self._conn() as conn:
-            if status is ItemStatus.UNKNOWN:
-                conn.execute("UPDATE cognitive_queue SET status=?,updated_at=? WHERE id=?",
-                             (status.value,_utcnow(),item_id))
+            row=conn.execute(
+                "SELECT kind,status FROM cognitive_queue WHERE id=?",(item_id,)
+            ).fetchone()
+            if row is None:
                 return
-            changed=conn.execute("""
+            current=ItemStatus(row["status"])
+            kind=row["kind"]
+            if (kind==ItemKind.ACTION_CANDIDATE.value
+                    and current is ItemStatus.UNKNOWN and status is not ItemStatus.UNKNOWN):
+                raise ValueError("quarantined capability effect requires explicit reconciliation")
+            if current is ItemStatus.PROCESSING:
+                raise PermissionError(
+                    "PROCESSING queue transitions require worker_id and claim_generation"
+                )
+            if status is ItemStatus.PROCESSING:
+                raise ValueError(
+                    "PROCESSING status must be acquired through claim_item() or pop_budgeted()"
+                )
+            if (kind==ItemKind.ACTION_CANDIDATE.value
+                    and status is ItemStatus.UNKNOWN and current is not ItemStatus.UNKNOWN):
+                raise PermissionError("action candidates must be claimed before quarantine")
+            conn.execute("""
               UPDATE cognitive_queue SET status=?,updated_at=?
-              WHERE id=? AND NOT (kind=? AND status=?)
-            """,(status.value,_utcnow(),item_id,ItemKind.ACTION_CANDIDATE.value,
-                 ItemStatus.UNKNOWN.value)).rowcount
-            if not changed:
-                row=conn.execute("SELECT kind,status FROM cognitive_queue WHERE id=?",
-                                 (item_id,)).fetchone()
-                if (row is not None and row["kind"]==ItemKind.ACTION_CANDIDATE.value
-                        and row["status"]==ItemStatus.UNKNOWN.value):
-                    raise ValueError("quarantined capability effect requires explicit reconciliation")
+              WHERE id=? AND status=?
+            """,(status.value,_utcnow(),item_id,current.value))
 
     def pending_count(self)->int:
         with self._conn() as conn:
@@ -296,9 +1003,12 @@ class PersistentCognitiveQueue:
 
     @staticmethod
     def _row(r,status):
+        keys=set(r.keys())
         return CognitiveItem(id=r["id"],kind=ItemKind(r["kind"]),content=json.loads(r["content_json"]),
           priority=float(r["priority"]),depth=int(r["depth"]),parent_id=r["parent_id"],
-          created_tick=int(r["created_tick"]),ttl=int(r["ttl"]),status=status)
+          created_tick=int(r["created_tick"]),ttl=int(r["ttl"]),status=status,
+          worker_id=r["worker_id"] if "worker_id" in keys else None,
+          claim_generation=int(r["claim_generation"] or 0) if "claim_generation" in keys else 0)
 
 class CognitiveEventBus:
     def __init__(self): self._subscribers=[]
@@ -316,8 +1026,13 @@ class WindowsCapabilityRegistry:
           "cognition.queue_human_review":self._queue_human_review,
         }
     def contains(self,capability): return capability in self.handlers
-    def execute(self,capability,payload):
+    def execute(self,capability,payload,idempotency_key=None):
         if capability not in self.handlers: raise KeyError("unregistered capability: "+capability)
+        # The stable effect ID travels with the dispatch as the provider
+        # idempotency key. Handlers ignore the extra key; a provider that
+        # honours it can dedupe a retried dispatch by this key.
+        if idempotency_key is not None:
+            payload = {**dict(payload), "_idempotency_key": idempotency_key}
         return self.handlers[capability](payload)
     def _commit_reflection(self,payload):
         text=str(payload.get("text","")).strip()
@@ -336,7 +1051,20 @@ class CognitiveScheduler:
     """One persistent macrotick clock coordinating cognition without recursive think()."""
     def __init__(self,stack:VictorCognitionStack,physiology:VictorPhysiologyRuntime,db_path:str|Path):
         self.stack=stack; self.physiology=physiology; self.db_path=Path(db_path)
-        self.queue=PersistentCognitiveQueue(self.db_path)
+        if Path(self.stack.db_path).resolve() != self.db_path.resolve():
+            raise ValueError(
+                "CognitiveScheduler requires the cognition stack and queue to share one SQLite database"
+            )
+        # One durable identity is shared by cognitive-queue and outbox claims.
+        self.worker_incarnation_id = uuid.uuid4().hex
+        self.worker_id = f"scheduler-{self.worker_incarnation_id}"
+        self.queue=PersistentCognitiveQueue(self.db_path,worker_id=self.worker_id)
+        self.outbox=self.queue.outbox
+        # Crash-injection hook (tests only): called with the effect ID after
+        # a successful dispatch and before the result is committed. Raising
+        # BaseException here simulates a process kill in that window.
+        self.crash_hook: Optional[Callable[[str], None]] = None
+        self.outbox_lease_seconds = 30
         self.registry=WindowsCapabilityRegistry(stack)
         self.bus=CognitiveEventBus(); self.bus.subscribe(self._ingest_event)
         self.current_tick=max(self._load_tick(),int(self.stack.tick))
@@ -344,7 +1072,9 @@ class CognitiveScheduler:
 
     def _conn(self):
         conn=sqlite3.connect(self.db_path,timeout=30); conn.row_factory=sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;"); return conn
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
 
     def _load_tick(self):
         with self._conn() as conn:
@@ -387,13 +1117,15 @@ class CognitiveScheduler:
           "active_goals":[g for g in self.stack.goals() if g.get("status")=="active"][:12],
         }
 
-    def _reason(self,item,context):
+    def _reason(self,item,context,*,connection=None):
         out={"followup_thoughts":[],"candidate_actions":[]}
         if item.kind in (ItemKind.QUERY,ItemKind.GOAL,ItemKind.CONFLICT,ItemKind.PREDICTION):
             text=str(item.content.get("text") or item.content.get("message") or _canonical_json(item.content))
-            before={a["id"] for a in self.stack.actions()}
-            report=self.stack.cycle(text,source="scheduler",tick=self.current_tick)
-            after=[a for a in self.stack.actions() if a["id"] not in before]
+            before={a["id"] for a in self.stack.actions(connection=connection)}
+            report=self.stack.cycle(
+                text,source="scheduler",tick=self.current_tick,connection=connection
+            )
+            after=[a for a in self.stack.actions(connection=connection) if a["id"] not in before]
             out["followup_thoughts"].append({
               "kind":ItemKind.THOUGHT,
               "content":{"step":"review_cognition_cycle","origin_item_id":item.id,"text":text,
@@ -425,7 +1157,7 @@ class CognitiveScheduler:
             if item.content.get("step")=="review_action_observation":
                 return out
             action_ids=[int(x) for x in item.content.get("stack_action_ids",[])]
-            actions={a["id"]:a for a in self.stack.actions()}
+            actions={a["id"]:a for a in self.stack.actions(connection=connection)}
             for aid in action_ids:
                 action=actions.get(aid)
                 if action and action["status"]=="proposed":
@@ -449,23 +1181,181 @@ class CognitiveScheduler:
         valid=[dict(c) for c in candidates if c.get("capability") and 0<=float(c.get("score",0))<=1]
         return sorted(valid,key=lambda c:(float(c.get("score",0)),str(c["capability"]),str(c.get("source_item_id",""))),reverse=True)
 
-    def _execute(self,ranked):
+    def _mark_linked_effect_unknown(
+        self, effect_id, error, *, queue_item_id,
+        outbox_claim_token, queue_claim_token,
+    ) -> bool:
+        """Quarantine a linked effect and its queue projection atomically."""
+        outbox_worker, outbox_generation = self.outbox._require_claim_token(
+            outbox_claim_token.get("worker_id"),
+            outbox_claim_token.get("claim_generation"),
+        )
+        queue_worker, queue_generation = self.queue._require_claim_token(
+            queue_claim_token.get("worker_id"),
+            queue_claim_token.get("claim_generation"),
+        )
+        if outbox_worker != queue_worker:
+            raise ValueError("linked outbox and queue claims must share a worker identity")
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT queue_item_id FROM effect_outbox WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            if row["queue_item_id"] != queue_item_id:
+                raise RuntimeError("effect is not linked to the selected queue item")
+            if not EffectOutbox._mark_unknown_with_conn(
+                conn, effect_id, error,
+                worker_id=outbox_worker,
+                claim_generation=outbox_generation,
+            ):
+                return False
+            if not self.queue._transition_claim_with_conn(
+                conn, queue_item_id, ItemStatus.UNKNOWN,
+                queue_worker, queue_generation,
+            ):
+                raise RuntimeError(
+                    "queue claim changed before ambiguous failure quarantine; "
+                    "rolling back outbox quarantine"
+                )
+        return True
+
+    def _execute(self,ranked,queue_item_id=None,queue_claim_token=None):
         if not ranked: return {"executed":None,"status":"NO_ACTION"}
+        if queue_item_id is not None:
+            if not isinstance(queue_claim_token,dict):
+                raise ValueError("queue claim token is required for selected action execution")
+            self.queue._require_claim_token(
+                queue_claim_token.get("worker_id"),queue_claim_token.get("claim_generation")
+            )
         c=ranked[0]; capability=str(c["capability"])
         if not self.registry.contains(capability):
             return {"executed":None,"status":"BLOCKED_UNREGISTERED_CAPABILITY","capability":capability}
+        payload=dict(c.get("payload",{}))
+        effect_id=effect_id_for_candidate(c)
+        digest=_payload_digest(payload)
+        # 1. Atomic intent record, before any dispatch. Same effect ID with
+        # a different payload raises ValueError: never silently re-dispatch.
+        intent=self.outbox.record_intent(
+            effect_id,capability,c.get("source_item_id"),digest,
+            queue_item_id=queue_item_id)
+        # A stable effect may already belong to an earlier queue candidate.
+        # That first projection remains canonical; a duplicate candidate must
+        # be completed without attempting to claim or dispatch the effect.
+        canonical_queue_item_id = intent.get("queue_item_id")
+        if queue_item_id is not None and canonical_queue_item_id != queue_item_id:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                canonical = conn.execute(
+                    "SELECT kind FROM cognitive_queue WHERE id=?",
+                    (canonical_queue_item_id,),
+                ).fetchone()
+                if (
+                    canonical is None
+                    or canonical["kind"] != ItemKind.ACTION_CANDIDATE.value
+                ):
+                    raise RuntimeError(
+                        "canonical action queue projection is missing or invalid; "
+                        "refusing duplicate effect dispatch"
+                    )
+                if not self.queue._transition_claim_with_conn(
+                    conn, queue_item_id, ItemStatus.COMPLETED,
+                    queue_claim_token["worker_id"],
+                    queue_claim_token["claim_generation"],
+                ):
+                    raise RuntimeError(
+                        "duplicate queue claim changed before deduplication"
+                    )
+            return {
+                "executed": None,
+                "status": "DEDUPED_DUPLICATE_QUEUE_PROJECTION",
+                "effect_id": effect_id,
+                "canonical_queue_item_id": canonical_queue_item_id,
+            }
+        # 2. Dedupe: an already-completed effect returns its stored outcome
+        # without touching the provider again.
+        if intent["status"]=="COMPLETED" and intent.get("result_json"):
+            stored=json.loads(intent["result_json"])
+            if queue_item_id is not None:
+                with self._conn() as conn:
+                    if not self.queue._transition_claim_with_conn(
+                        conn,queue_item_id,ItemStatus.COMPLETED,
+                        queue_claim_token["worker_id"],queue_claim_token["claim_generation"]
+                    ):
+                        raise RuntimeError("queue claim changed before completed-effect acknowledgement")
+            return stored
+        if intent["status"]=="UNKNOWN":
+            raise RuntimeError(
+                f"ambiguous capability effect {effect_id} requires reconciliation")
+        if intent["status"]=="FAILED":
+            return {"executed":None,"status":"BLOCKED_DLQ","capability":capability,
+                    "effect_id":effect_id}
+        # 3. Concurrency-safe claim: exactly one worker may dispatch.
+        # A linked effect is claimed under the exact queue owner token, not
+        # a separately inferred scheduler identity. Standalone effects retain
+        # the scheduler's own worker identity.
+        worker_id=(
+            queue_claim_token["worker_id"] if queue_item_id is not None else self.worker_id
+        )
+        claim_token=self.outbox.claim_with_token(
+            effect_id,worker_id,lease_seconds=self.outbox_lease_seconds,
+            queue_claim_generation=(
+                queue_claim_token["claim_generation"] if queue_item_id is not None else None
+            ))
+        if claim_token is None:
+            return {"executed":None,"status":"BLOCKED_CLAIMED","capability":capability,
+                    "effect_id":effect_id}
+        claim_generation=claim_token["claim_generation"]
         proposal=ActionProposal(
           name=capability,capability=capability,provenance="victor-cognitive-scheduler",
           required_authorities=("local_owner",),consequence=.08,irreversibility=.05,
           uncertainty=max(0.0,1.0-float(c.get("score",.5))),novelty=.10,arousal=0,
           urgency=0,capability_power=.10,
-          metadata={"scheduler_tick":self.current_tick,"source_item_id":c.get("source_item_id")})
-        d=self.physiology.execute(proposal,lambda:self.registry.execute(capability,dict(c.get("payload",{}))))
+          metadata={"scheduler_tick":self.current_tick,"source_item_id":c.get("source_item_id"),
+                    "effect_id":effect_id,"idempotency_key":effect_id})
+        # 4. Dispatch with the stable effect ID as the provider idempotency key.
+        d=self.physiology.execute(proposal,
+            lambda:self.registry.execute(capability,payload,idempotency_key=effect_id))
+        # Governance rejected before the executor ran: provably no effect,
+        # so release the claim and record the rejection exactly as before.
+        # A governance rejection provably never ran. Its outbox release is
+        # committed with the queue/result/observation transaction below.
+        # A provider timeout / connection failure is ambiguous: the effect
+        # may or may not have happened. Quarantine it; never record a
+        # terminal outcome and never auto-retry.
+        if d.status.value=="FAILED":
+            outcome=d.actual_outcome or {}
+            error_type=str(outcome.get("error_type",""))
+            if error_type in _AMBIGUOUS_ERROR_TYPES:
+                error = f"ambiguous provider failure: {error_type}: {outcome.get('error','')}"
+                if queue_item_id is not None:
+                    marked = self._mark_linked_effect_unknown(
+                        effect_id, error,
+                        queue_item_id=queue_item_id,
+                        outbox_claim_token=claim_token,
+                        queue_claim_token=queue_claim_token,
+                    )
+                else:
+                    marked = self.outbox.mark_unknown(
+                        effect_id, error,
+                        worker_id=worker_id,claim_generation=claim_generation,
+                    )
+                if not marked:
+                    raise RuntimeError("outbox claim changed before ambiguous failure quarantine")
+                raise RuntimeError(
+                    f"ambiguous provider failure for effect {effect_id} "
+                    f"({error_type}); requires reconciliation")
         observation_id=uuid.uuid4().hex
         result={"capability":capability,"decision_status":d.status.value,
           "governance_mode":d.governance_mode.value,"reasons":list(d.reasons),
           "receipt_hash":d.receipt_hash,"outcome":d.actual_outcome,
-          "observation_event_id":observation_id}
+          "observation_event_id":observation_id,
+          "effect_id":effect_id,"idempotency_key":effect_id}
+        # Crash-injection point (tests only): after dispatch, before commit.
+        if self.crash_hook is not None:
+            self.crash_hook(effect_id)
         observation=CognitiveItem(
           id=observation_id,kind=ItemKind.OBSERVATION,
           content={"event_type":"action_observation","capability":capability,
@@ -475,6 +1365,13 @@ class CognitiveScheduler:
           priority=max(0.05,min(1.0,float(c.get("score",0.5)))),
           depth=int(c.get("source_depth",0))+1,
           parent_id=c.get("source_item_id"),created_tick=self.current_tick)
+        # 5. One atomic transaction: capability result + observation +
+        # outbox completion. If any part fails, all of it rolls back and the
+        # outbox stays CLAIMED (restart recovery quarantines it UNKNOWN).
+        # A REJECTED dispatch provably never ran, so its outcome is recorded
+        # in capability_results exactly as before but the outbox is NOT
+        # completed: a later dispatch must re-evaluate governance.
+        record_outcome = d.status.value != "REJECTED"
         with self._conn() as conn:
             conn.execute("""INSERT INTO capability_results
               (tick,capability,status,payload_json,receipt_hash,observation_event_id,
@@ -485,7 +1382,138 @@ class CognitiveScheduler:
                float(c.get("score",0.5)),_utcnow()))
             if not self.queue._insert_with_conn(conn,observation):
                 raise RuntimeError("durable observation id collision")
+            if record_outcome:
+                if not EffectOutbox._complete_with_conn(
+                    conn,effect_id,{"executed":result,"status":d.status.value},observation_id,
+                    worker_id=worker_id,claim_generation=claim_generation):
+                    raise RuntimeError("outbox claim changed before completion; rolling back result")
+            else:
+                if not EffectOutbox._release_claim_with_conn(
+                    conn,effect_id,worker_id,claim_generation
+                ):
+                    raise RuntimeError("outbox claim changed before governance rejection release")
+            if queue_item_id is not None:
+                if not self.queue._transition_claim_with_conn(
+                    conn,queue_item_id,ItemStatus.COMPLETED,
+                    queue_claim_token["worker_id"],queue_claim_token["claim_generation"]
+                ):
+                    raise RuntimeError("queue claim changed before result commit; rolling back result")
         return {"executed":result,"status":d.status.value}
+
+    def reconcile_effect(self, effect_id, outcome, provider_receipt=None):
+        """Reconcile an UNKNOWN effect and its queue projection atomically.
+
+        The outbox row, capability result, observation, and linked action queue
+        projection share one SQLite transaction. A crash or failed queue update
+        therefore cannot leave READY/COMPLETED in one table and UNKNOWN in the
+        other. Provider receipt authenticity remains an external approval gate.
+        """
+        if outcome not in ("executed", "not_executed", "unknown"):
+            raise ValueError(f"unknown reconciliation outcome: {outcome!r}")
+        with self._conn() as conn:
+            raw = conn.execute(
+                "SELECT * FROM effect_outbox WHERE effect_id=?", (effect_id,)
+            ).fetchone()
+            if raw is None:
+                raise KeyError(f"unknown effect_id: {effect_id}")
+            row = EffectOutbox._row_dict(raw)
+            if outcome == "unknown":
+                return {"effect_id": effect_id, "status": row["status"],
+                        "outcome": "unknown", "changed": False}
+
+            if row["status"] == "COMPLETED" and row.get("result_json"):
+                if outcome == "not_executed":
+                    raise ValueError(
+                        f"effect {effect_id} already recorded COMPLETED; "
+                        "provider 'not_executed' contradicts the recorded outcome")
+                if row.get("queue_item_id"):
+                    try:
+                        self.queue._reconcile_mark_with_conn(
+                            conn, row["queue_item_id"], ItemStatus.COMPLETED,
+                            allow_already_target=True)
+                    except ValueError:
+                        # Preserve the existing idempotent repair behavior for
+                        # legacy/missing queue projections; do not rewrite them.
+                        pass
+                return {"effect_id": effect_id, "status": "COMPLETED",
+                        "outcome": "executed", "changed": False,
+                        "executed": json.loads(row["result_json"])}
+
+            if row["status"] != "UNKNOWN":
+                raise ValueError(
+                    f"effect {effect_id} in {row['status']} cannot be reconciled; "
+                    "only UNKNOWN effects may transition")
+
+            if outcome == "not_executed":
+                # Update outbox first intentionally: the following queue update
+                # must roll it back if the queue projection is missing or invalid.
+                reconciled = EffectOutbox._reconcile_with_conn(
+                    conn, effect_id, "not_executed",
+                    provider_receipt=provider_receipt)
+                if row.get("queue_item_id"):
+                    self.queue._reconcile_mark_with_conn(
+                        conn, row["queue_item_id"], ItemStatus.PENDING,
+                        allow_already_target=True)
+                return {"effect_id": effect_id, "status": reconciled["status"],
+                        "outcome": "not_executed",
+                        "changed": reconciled["changed"]}
+
+            # outcome == "executed"
+            observation_id = row.get("observation_event_id") or uuid.uuid4().hex
+            result = {
+                "capability": row["capability"],
+                "decision_status": "EXECUTED",
+                "governance_mode": "GREEN",
+                "reasons": ["provider_reconciliation"],
+                "receipt_hash": (
+                    row.get("result_json")
+                    and json.loads(row["result_json"]).get("executed", {}).get("receipt_hash")
+                ),
+                "outcome": {
+                    "ok": True,
+                    "result": {"reconciled": True, "provider_receipt": provider_receipt},
+                },
+                "observation_event_id": observation_id,
+                "effect_id": effect_id,
+                "idempotency_key": effect_id,
+            }
+            stored = {"executed": result, "status": "EXECUTED"}
+            conn.execute("""INSERT OR IGNORE INTO capability_results
+              (tick,capability,status,payload_json,receipt_hash,observation_event_id,
+               source_item_id,source_depth,priority,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (self.current_tick, row["capability"], "EXECUTED",
+               _canonical_json(result), result["receipt_hash"], observation_id,
+               row.get("source_item_id"), 0, 0.5, _utcnow()))
+            observation = CognitiveItem(
+                id=observation_id,
+                kind=ItemKind.OBSERVATION,
+                content={
+                    "event_type": "action_observation",
+                    "capability": row["capability"],
+                    "status": "EXECUTED",
+                    "governance_mode": "GREEN",
+                    "reasons": ["provider_reconciliation"],
+                    "receipt_hash": result["receipt_hash"],
+                    "outcome": result["outcome"],
+                    "reconciled": True,
+                },
+                priority=0.5,
+                depth=1,
+                parent_id=row.get("source_item_id"),
+                created_tick=self.current_tick,
+            )
+            self.queue._insert_with_conn(conn, observation)
+            reconciled = EffectOutbox._reconcile_with_conn(
+                conn, effect_id, "executed", result=stored,
+                observation_event_id=observation_id)
+            if row.get("queue_item_id"):
+                self.queue._reconcile_mark_with_conn(
+                    conn, row["queue_item_id"], ItemStatus.COMPLETED,
+                    allow_already_target=True)
+            return {"effect_id": effect_id, "status": reconciled["status"],
+                    "outcome": "executed", "changed": reconciled["changed"],
+                    "executed": stored}
 
     def _recover_missing_observations(self):
         """Project legacy committed results into exactly one durable observation."""
@@ -551,50 +1579,245 @@ class CognitiveScheduler:
         receipt={"tick":self.current_tick,"queue_size_start":self.queue.pending_count(),
           "processed":0,"generated_thoughts":0,"generated_actions":0,
           "deferred_actions":0,"execution":None}
-        work=self.queue.pop_budgeted(self.current_tick,max_items,max_ms)
-        receipt["processed"]=len(work); candidates=[]
+        work=self.queue.pop_budgeted(
+            self.current_tick,max_items,max_ms,worker_id=self.worker_id
+        )
+        receipt["processed"]=len(work)
+        candidates=[]
+        preclaimed_actions={}
         for item in work:
+            claim_token={"worker_id":item.worker_id,
+                         "claim_generation":item.claim_generation}
+            if not self.queue.owns_claim(item.id,**claim_token):
+                receipt.setdefault("stale_claims",[]).append(item.id)
+                continue
+
+            # Persisted ACTION_CANDIDATE rows are already durable queue
+            # projections. Reuse their current claim and outbox link instead
+            # of completing the row and creating a second projection for the
+            # same stable effect ID.
+            if item.kind is ItemKind.ACTION_CANDIDATE:
+                candidate=item.content.get("candidate")
+                if not isinstance(candidate,dict) or not candidate.get("capability"):
+                    if not self.queue.mark_claimed(
+                        item.id,ItemStatus.FAILED,**claim_token
+                    ):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale malformed action transition: {item.id}"
+                        )
+                    receipt.setdefault("errors",[]).append(
+                        f"invalid persisted action candidate: {item.id}"
+                    )
+                    continue
+                effect_id=effect_id_for_candidate(candidate)
+                try:
+                    intent=self.outbox.record_intent(
+                        effect_id,str(candidate["capability"]),
+                        candidate.get("source_item_id"),
+                        _payload_digest(candidate.get("payload",{})),
+                        queue_item_id=item.id,
+                    )
+                except ValueError as exc:
+                    existing=self.outbox.get(effect_id)
+                    target=(
+                        ItemStatus.UNKNOWN
+                        if existing and existing.get("status") in ("CLAIMED","UNKNOWN")
+                        else ItemStatus.FAILED
+                    )
+                    if not self.queue.mark_claimed(item.id,target,**claim_token):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale action intent conflict transition: {item.id}"
+                        )
+                    receipt.setdefault("errors",[]).append(
+                        f"effect intent conflict: {exc}"
+                    )
+                    continue
+                canonical_queue_item_id=intent.get("queue_item_id")
+                if canonical_queue_item_id!=item.id:
+                    try:
+                        with self._conn() as conn:
+                            conn.execute("BEGIN IMMEDIATE")
+                            canonical=conn.execute(
+                                "SELECT kind FROM cognitive_queue WHERE id=?",
+                                (canonical_queue_item_id,),
+                            ).fetchone()
+                            if (
+                                canonical is None
+                                or canonical["kind"]!=ItemKind.ACTION_CANDIDATE.value
+                            ):
+                                raise RuntimeError(
+                                    "canonical action queue projection is missing or invalid"
+                                )
+                            if not self.queue._transition_claim_with_conn(
+                                conn,item.id,ItemStatus.COMPLETED,
+                                claim_token["worker_id"],claim_token["claim_generation"]
+                            ):
+                                raise RuntimeError(
+                                    "duplicate queue claim changed before deduplication"
+                                )
+                    except Exception as exc:
+                        if not self.queue.mark_claimed(
+                            item.id,ItemStatus.UNKNOWN,**claim_token
+                        ):
+                            receipt.setdefault("errors",[]).append(
+                                f"stale duplicate action transition: {item.id}"
+                            )
+                        receipt.setdefault("errors",[]).append(
+                            f"duplicate action projection blocked: {exc}"
+                        )
+                    continue
+                preclaimed_actions[effect_id]=(item,dict(candidate),claim_token)
+                candidates.append(dict(candidate))
+                continue
+
             try:
-                reasoned=self._reason(item,self._retrieve_context(item))
-                for f in reasoned["followup_thoughts"]:
-                    child=CognitiveItem(id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
-                      priority=max(0,min(1,float(f.get("priority",.5)))),depth=item.depth+1,
-                      parent_id=item.id,created_tick=self.current_tick)
-                    if self.queue.push(child): receipt["generated_thoughts"]+=1
+                context=self._retrieve_context(item)
+                connection=self._conn()
+                previous_stack_tick=self.stack.tick
+                try:
+                    # Hold SQLite's writer lock from claim validation through
+                    # cognition persistence and parent/follow-up publication.
+                    connection.execute("BEGIN IMMEDIATE")
+                    self.queue.assert_claim_owned_with_conn(
+                        connection,item.id,**claim_token
+                    )
+                    reasoned=self._reason(item,context,connection=connection)
+                    followups=[]
+                    for f in reasoned["followup_thoughts"]:
+                        followups.append(CognitiveItem(
+                          id=uuid.uuid4().hex,kind=f["kind"],content=dict(f["content"]),
+                          priority=max(0,min(1,float(f.get("priority",.5)))),depth=item.depth+1,
+                          parent_id=item.id,created_tick=self.current_tick))
+                    inserted=self.queue.complete_claim_with_followups_with_conn(
+                        connection,item.id,followups,**claim_token
+                    )
+                    if inserted is None:
+                        raise RuntimeError(f"stale queue completion: {item.id}")
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    self.stack.tick=previous_stack_tick
+                    raise
+                finally:
+                    connection.close()
+                receipt["generated_thoughts"]+=inserted
                 candidates.extend(reasoned["candidate_actions"])
                 receipt["generated_actions"]+=len(reasoned["candidate_actions"])
-                self.queue.mark(item.id,ItemStatus.COMPLETED)
             except Exception as exc:
-                self.queue.mark(item.id,ItemStatus.FAILED)
+                if not self.queue.mark_claimed(
+                    item.id,ItemStatus.FAILED,**claim_token
+                ):
+                    receipt.setdefault("errors",[]).append(
+                        f"stale queue failure transition: {item.id}"
+                    )
                 receipt.setdefault("errors",[]).append(f"{type(exc).__name__}: {exc}")
+
         ranked=self._choice_rank(candidates)
-        selected_action_id=None
-        for index,candidate in enumerate(ranked):
+        durable_ranked=[]
+        seen_effect_ids=set()
+        for candidate in ranked:
+            effect_id=effect_id_for_candidate(candidate)
+            if effect_id in seen_effect_ids:
+                continue
+            if effect_id in preclaimed_actions:
+                durable_ranked.append(preclaimed_actions[effect_id])
+                seen_effect_ids.add(effect_id)
+                continue
+
+            # A stable effect already linked to another queue row is not
+            # copied into a new row. Its canonical projection remains the
+            # only item allowed to claim or reconcile the effect.
+            existing=self.outbox.get(effect_id)
+            if existing and existing.get("queue_item_id") is not None:
+                receipt["deferred_actions"]+=1
+                seen_effect_ids.add(effect_id)
+                continue
+
             durable_action=CognitiveItem(
               id=uuid.uuid4().hex,kind=ItemKind.ACTION_CANDIDATE,
               content={"candidate":candidate},priority=float(candidate.get("score",0.5)),
               depth=int(candidate.get("source_depth",0)),
               parent_id=candidate.get("source_item_id"),created_tick=self.current_tick)
-            if not self.queue.push(durable_action):
+            try:
+                pushed=self.queue.push_with_effect_intent(
+                    durable_action,effect_id,str(candidate["capability"]),
+                    candidate.get("source_item_id"),_payload_digest(candidate.get("payload",{})))
+            except ValueError as exc:
+                receipt.setdefault("errors",[]).append(f"effect intent conflict: {exc}")
+                continue
+            if not pushed:
                 raise RuntimeError("failed to persist action candidate")
+            durable_ranked.append((durable_action,candidate,None))
+            seen_effect_ids.add(effect_id)
+
+        selected_action_id=None
+        selected_action_token=None
+        selected_candidate=None
+        for index,(durable_action,candidate,existing_token) in enumerate(durable_ranked):
             if index==0:
+                if existing_token is None:
+                    claimed_action=self.queue.claim_item(
+                        durable_action.id,worker_id=self.worker_id
+                    )
+                    if claimed_action is None:
+                        receipt["execution"]={
+                            "executed":None,"status":"BLOCKED_QUEUE_CLAIM",
+                            "queue_item_id":durable_action.id
+                        }
+                        receipt["execution_blocked"]="BLOCKED_QUEUE_CLAIM"
+                        continue
+                    selected_action_token={
+                        "worker_id":claimed_action.worker_id,
+                        "claim_generation":claimed_action.claim_generation
+                    }
+                else:
+                    selected_action_token=existing_token
                 selected_action_id=durable_action.id
-                self.queue.mark(selected_action_id,ItemStatus.PROCESSING)
+                selected_candidate=candidate
             else:
+                if existing_token is not None:
+                    with self._conn() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        if not self.queue._transition_claim_with_conn(
+                            conn,durable_action.id,ItemStatus.PENDING,
+                            existing_token["worker_id"],
+                            existing_token["claim_generation"],
+                        ):
+                            receipt.setdefault("errors",[]).append(
+                                f"stale deferred action claim: {durable_action.id}"
+                            )
                 receipt["deferred_actions"]+=1
-        # Every candidate is durable before capability invocation. A selected
-        # PROCESSING claim has an ambiguous outcome after a crash or exception:
-        # quarantine it as UNKNOWN until a human/provider reconciles the effect.
-        # This is a fail-closed mitigation, NOT an idempotent transactional outbox.
-        try:
-            receipt["execution"]=self._execute(ranked)
-        except BaseException:
-            if selected_action_id is not None:
-                self.queue.mark(selected_action_id,ItemStatus.UNKNOWN)
-            raise
-        else:
-            if selected_action_id is not None:
-                self.queue.mark(selected_action_id,ItemStatus.COMPLETED)
+
+        # Only the selected durable action is dispatched. Unselected persisted
+        # action rows return to PENDING with their outbox intent still READY.
+        if selected_action_id is not None:
+            try:
+                receipt["execution"]=self._execute(
+                    [selected_candidate],queue_item_id=selected_action_id,
+                    queue_claim_token=selected_action_token
+                )
+            except BaseException:
+                self.queue.mark_claimed(
+                    selected_action_id,ItemStatus.UNKNOWN,**selected_action_token
+                )
+                raise
+            else:
+                status=str(receipt["execution"].get("status",""))
+                if status in ("BLOCKED_DLQ","BLOCKED_UNREGISTERED_CAPABILITY"):
+                    if not self.queue.mark_claimed(
+                        selected_action_id,ItemStatus.FAILED,**selected_action_token
+                    ):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale queue failure transition: {selected_action_id}"
+                        )
+                elif status.startswith("BLOCKED_"):
+                    if not self.queue.mark_claimed(
+                        selected_action_id,ItemStatus.UNKNOWN,**selected_action_token
+                    ):
+                        receipt.setdefault("errors",[]).append(
+                            f"stale queue quarantine transition: {selected_action_id}"
+                        )
         receipt["queue_size_end"]=self.queue.pending_count()
         receipt["receipt_hash"]=self._write_tick_receipt({k:v for k,v in receipt.items() if k!="receipt_hash"})
         return receipt

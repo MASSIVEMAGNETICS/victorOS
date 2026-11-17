@@ -287,6 +287,13 @@ class VictorWindowsRuntime:
             physiology=self.physiology,
             db_path=self.state_dir / "victor_stack.db",
         )
+        # The process-lifetime exclusive state lock was acquired before the
+        # scheduler was constructed. For this single-owner Windows runtime,
+        # acquiring that OS lock proves no previous lock holder remains live.
+        # Recover only inside this protected startup path, never in queue init.
+        self.scheduler.queue.recover_after_confirmed_shutdown(
+            confirmed_terminated=True
+        )
 
         if not self.episodes.verify_integrity():
             self.startup_fault = self.startup_fault or "episode_ledger_integrity_failure"
